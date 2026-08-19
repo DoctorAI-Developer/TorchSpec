@@ -58,6 +58,7 @@ from tqdm import tqdm
 from typing_extensions import override
 
 from torchspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from torchspec.models.draft.dflash2 import dflash2_config_for_serving
 from torchspec.models.draft.keymap import DRAFT_WEIGHT_KEY_REMAP
 
 logging.basicConfig(
@@ -143,6 +144,7 @@ def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tens
 
 
 _MODEL_TYPE_REMAP = {
+    "qwen3_dflash2": "qwen3",
     "qwen3_dspark": "qwen3",
 }
 
@@ -159,6 +161,9 @@ def _fixup_export_config(raw_config: dict, export_for_vllm: bool = False) -> dic
         eagle_cfg = config.get("eagle_config")
         if eagle_cfg and key in eagle_cfg:
             eagle_cfg[key] = [x + 1 for x in eagle_cfg[key]]
+
+    if config.get("architectures") == ["DFlash2DraftModel"]:
+        config = dflash2_config_for_serving(config)
 
     if config["model_type"] in _MODEL_TYPE_REMAP:
         config["model_type"] = _MODEL_TYPE_REMAP[config["model_type"]]

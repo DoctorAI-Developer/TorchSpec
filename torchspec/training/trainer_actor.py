@@ -26,11 +26,29 @@ import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
+from torchspec.models.draft.dflash2 import DFlash2Config
 from torchspec.models.draft.dspark import DSparkConfig
 from torchspec.ray.ray_actor import RayActor
-from torchspec.training.eagle3_trainer import Eagle3Trainer
 from torchspec.utils.distributed import init_gloo_group, init_usp_groups
 from torchspec.utils.logging import setup_file_logging
+
+
+def _trainer_class_for_config(draft_model_config):
+    if isinstance(draft_model_config, DFlash2Config):
+        from torchspec.training.dflash2_trainer import DFlash2Trainer
+
+        return DFlash2Trainer
+    if isinstance(draft_model_config, DSparkConfig):
+        from torchspec.training.dspark_trainer import DSparkTrainer
+
+        return DSparkTrainer
+    if isinstance(draft_model_config, DFlashConfig):
+        from torchspec.training.dflash_trainer import DFlashTrainer
+
+        return DFlashTrainer
+    from torchspec.training.eagle3_trainer import Eagle3Trainer
+
+    return Eagle3Trainer
 
 
 class TrainerActor(RayActor):
@@ -76,21 +94,8 @@ class TrainerActor(RayActor):
         if draft_model_config is None and getattr(args, "draft_model_config", None):
             draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-        # Config-based trainer dispatch.
-        # DSparkConfig subclasses DFlashConfig, so it must be checked first.
-        # - DSparkConfig → DSparkTrainer
-        # - DFlashConfig → DFlashTrainer
-        # - else Eagle3.
-        if isinstance(draft_model_config, DSparkConfig):
-            from torchspec.training.dspark_trainer import DSparkTrainer
-
-            self._trainer = DSparkTrainer(args)
-        elif isinstance(draft_model_config, DFlashConfig):
-            from torchspec.training.dflash_trainer import DFlashTrainer
-
-            self._trainer = DFlashTrainer(args)
-        else:
-            self._trainer = Eagle3Trainer(args)
+        trainer_class = _trainer_class_for_config(draft_model_config)
+        self._trainer = trainer_class(args)
 
         target_model_path = getattr(args, "target_model_path", None)
 

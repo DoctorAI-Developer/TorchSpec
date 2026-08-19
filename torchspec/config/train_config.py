@@ -160,6 +160,9 @@ class TrainingConfig:
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
 
+    # DFlash2-specific parameters (used by DFlash2 trainer only)
+    dflash2_selector_loss_alpha: float = 1.0
+
     # DSpark-specific parameters (used by DSpark trainer only)
     dspark_num_anchors: int = 512
     dspark_num_target_layers: int = 5

@@ -259,20 +259,23 @@ def _get_draft_model_config(args):
 
 
 def _validate_and_configure_dflash(args, draft_model_config) -> None:
-    """Validate
-    -specific config and auto-set aux layer IDs.
+    """Validate DFlash-specific config and auto-set aux layer IDs.
 
     Called before dataset loading to fail fast on misconfigurations.
     """
     from torchspec.models.draft.dflash import DFlashConfig
+    from torchspec.models.draft.dflash2 import DFlash2Config
     from torchspec.models.draft.dspark import DSparkConfig
 
     if not isinstance(draft_model_config, DFlashConfig):
         return
 
-    # DSparkConfig subclasses DFlashConfig
+    is_dflash2 = isinstance(draft_model_config, DFlash2Config)
     is_dspark = isinstance(draft_model_config, DSparkConfig)
-    algo = "DSpark" if is_dspark else "DFlash"
+    algo = "DFlash2" if is_dflash2 else "DSpark" if is_dspark else "DFlash"
+
+    if is_dflash2 and getattr(args, "attention_backend", None) == "usp":
+        raise ValueError("DFlash2 does not support training.attention_backend=usp.")
 
     engine_type = getattr(args, "inference_engine_type", "hf")
     if engine_type not in ("vllm", "sgl", "trtllm", "offline"):
@@ -281,8 +284,20 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             f"('vllm', 'sgl', 'trtllm', 'offline'), got '{engine_type}'."
         )
     if getattr(args, "defer_tokenization", False):
-        raise NotImplementedError("DFlash does not support defer_tokenization=True.")
+        raise NotImplementedError(f"{algo} does not support defer_tokenization=True.")
     block_size = getattr(args, "dflash_block_size", 16)
+    if is_dflash2 and block_size != draft_model_config.block_size:
+        raise ValueError(
+            "training.dflash_block_size must match dflash_config.block_size "
+            f"({block_size} != {draft_model_config.block_size})."
+        )
+    num_target_layers = getattr(args, "dflash_num_target_layers", 5)
+    if is_dflash2 and num_target_layers != draft_model_config.num_target_layers:
+        raise ValueError(
+            "training.dflash_num_target_layers must match the number of "
+            f"dflash_config.target_layer_ids ({num_target_layers} != "
+            f"{draft_model_config.num_target_layers})."
+        )
     min_loss = getattr(args, "min_loss_tokens", 0)
     if min_loss < 2 * block_size:
         raise ValueError(
@@ -290,17 +305,22 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             f"({min_loss} < {2 * block_size}). Set dataset.min_loss_tokens={2 * block_size}."
         )
 
-    # Auto-set aux layer IDs from draft config if not explicitly provided
+    target_layer_ids = getattr(draft_model_config, "target_layer_ids", None)
     if not getattr(args, "aux_hidden_states_layers", None):
         from torchspec.models.draft.dflash import build_target_layer_ids
 
-        target_layer_ids = getattr(draft_model_config, "target_layer_ids", None)
         if target_layer_ids is None:
             num_target = getattr(draft_model_config, "num_target_layers", 5)
             target_num_hidden = getattr(draft_model_config, "target_num_hidden_layers", 36)
             target_layer_ids = build_target_layer_ids(num_target, target_num_hidden)
         args.aux_hidden_states_layers = target_layer_ids
-        logger.info(f"DFlash: set aux_hidden_states_layers = {target_layer_ids}")
+        logger.info(f"{algo}: set aux_hidden_states_layers = {target_layer_ids}")
+    elif is_dflash2 and list(args.aux_hidden_states_layers) != list(target_layer_ids):
+        raise ValueError(
+            "inference.aux_hidden_states_layers must match "
+            f"dflash_config.target_layer_ids ({list(args.aux_hidden_states_layers)} != "
+            f"{list(target_layer_ids)})."
+        )
 
 
 def train_async_no_generation(args):

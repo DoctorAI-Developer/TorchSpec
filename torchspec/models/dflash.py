@@ -38,13 +38,20 @@ from torchspec.utils.logging import logger
 _VALID_DFLASH_LOSS_OBJECTIVES = {"decay", "dpace"}
 
 
-def _dpace_position_weights(confidences: torch.Tensor, alpha: float) -> torch.Tensor:
+def _dpace_position_weights(
+    confidences: torch.Tensor,
+    alpha: float,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Compute detached D-PACE weights from per-position draft confidences."""
     if not 0.0 <= alpha <= 1.0:
         raise ValueError(f"dflash_dpace_alpha must be in [0, 1], got {alpha}")
 
     with torch.no_grad():
         smoothed = (1.0 - alpha) * confidences.float() + alpha
+        if valid_mask is not None:
+            valid_prefix = valid_mask.to(torch.int32).cumprod(dim=-1).bool()
+            smoothed = torch.where(valid_prefix, smoothed, torch.zeros_like(smoothed))
         prefix_products = torch.cumprod(smoothed, dim=-1)
         weights = torch.flip(
             torch.cumsum(torch.flip(prefix_products, dims=[-1]), dim=-1),
@@ -58,6 +65,8 @@ def _create_dflash_mask_mod(
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    is_causal: bool = False,
+    sliding_window: int | None = None,
 ):
     """Create a mask_mod function for DFlash block-causal attention.
 
@@ -66,7 +75,7 @@ def _create_dflash_mask_mod(
 
     Rules:
       1. Each block sees context strictly before its anchor (kv_idx < anchor_pos)
-      2. Intra-block attention is bidirectional (per SpecForge PR #427)
+      2. Intra-block attention follows is_causal and sliding_window
       3. Different blocks are invisible to each other
       4. Invalid blocks (block_keep_mask=False) see nothing
     """
@@ -82,6 +91,17 @@ def _create_dflash_mask_mod(
         is_draft = kv_idx >= ctx_len
         kv_block_id = (kv_idx - ctx_len) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
+
+        q_offset = q_idx % block_size
+        kv_offset = (kv_idx - ctx_len) % block_size
+        if is_causal:
+            mask_draft = mask_draft & (kv_offset <= q_offset)
+        if sliding_window is not None:
+            query_position = anchor_pos + q_offset
+            mask_context = mask_context & (query_position - kv_idx < sliding_window)
+            mask_draft = mask_draft & (
+                abs(query_position - (anchor_pos + kv_offset)) < sliding_window
+            )
 
         is_valid_block = block_keep_mask[b, q_block_id]
         return (mask_context | mask_draft) & is_valid_block
@@ -251,6 +271,27 @@ class DFlashModel(nn.Module):
 
         return self.draft_model.embed_tokens(noise_ids)
 
+    def _block_mask_options(self) -> dict:
+        return {}
+
+    def _compute_logits(
+        self,
+        draft_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        if hasattr(self.draft_model, "lm_head"):
+            return self.draft_model.lm_head(draft_hidden)
+        return F.linear(draft_hidden, lm_head_weight)
+
+    def _extra_training_loss(
+        self,
+        draft_hidden: torch.Tensor,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        objective_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict]:
+        return logits.new_zeros(()), {}
+
     def _draft_backbone(
         self,
         input_ids: torch.Tensor,
@@ -302,6 +343,7 @@ class DFlashModel(nn.Module):
                 block_keep_mask=block_keep_mask,
                 ctx_len=seq_len,
                 block_size=self.block_size,
+                **self._block_mask_options(),
             )
             block_mask = compile_friendly_create_block_mask(
                 mask_mod=mask_mod,
@@ -367,11 +409,7 @@ class DFlashModel(nn.Module):
         )
 
         # 7. Compute logits via frozen LM head
-        logits = (
-            self.draft_model.lm_head(draft_hidden)
-            if hasattr(self.draft_model, "lm_head")
-            else F.linear(draft_hidden, lm_head_weight)
-        )
+        logits = self._compute_logits(draft_hidden, lm_head_weight)
 
         # 8. Compute labels and weight mask (SpecForge pattern)
         # Labels: same-position prediction (position k predicts token at anchor+k)
@@ -451,6 +489,7 @@ class DFlashModel(nn.Module):
                     dpace_pred_weights = _dpace_position_weights(
                         target_confidences,
                         self.dpace_alpha,
+                        valid_mask=weight_mask[..., 1:] > 0,
                     ).to(dtype=weight_mask.dtype)
                 dpace_weights[..., 1:] = dpace_pred_weights
             objective_weights = weight_mask * dpace_weights
@@ -458,6 +497,13 @@ class DFlashModel(nn.Module):
         flat_weights = objective_weights.view(-1)
         loss_numerator = (loss_per_token * flat_weights).sum()
         loss_denominator = flat_weights.sum()
+        extra_numerator, loss_components = self._extra_training_loss(
+            draft_hidden=draft_hidden,
+            logits=logits,
+            target_ids=target_ids,
+            objective_weights=objective_weights,
+        )
+        loss_numerator = loss_numerator + extra_numerator
         loss = loss_numerator / loss_denominator.clamp(min=1e-6)
 
         # 10. Accuracy (using binary mask without decay)
@@ -481,7 +527,6 @@ class DFlashModel(nn.Module):
                 dim=(0, 1)
             ) / count_per_pos
 
-        loss_components = {}
         return (
             loss,
             accuracy,

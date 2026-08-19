@@ -28,6 +28,7 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 
 from torchspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from torchspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
+from torchspec.models.draft.dflash2 import DFlash2Config, DFlash2DraftModel
 from torchspec.models.draft.dspark import (
     DSparkConfig,
     DSparkDraftModel,
@@ -43,6 +44,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         LlamaConfig: LlamaForCausalLMEagle3,
         DeepseekV3Config: Eagle3DeepseekV2ForCausalLM,
         DFlashConfig: DFlashDraftModel,
+        DFlash2Config: DFlash2DraftModel,
         DSparkConfig: DSparkDraftModel,
         K3DSparkConfig: K3DSparkModel,
     }
@@ -85,6 +87,7 @@ class AutoDraftModelConfig:
         "LlamaForCausalLMEagle3": LlamaConfig,
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "DFlashDraftModel": DFlashConfig,
+        "DFlash2DraftModel": DFlash2Config,
         "Qwen3DSparkModel": DSparkConfig,
         "DSparkDraftModel": DSparkConfig,
         "K3DSparkModel": K3DSparkConfig,
