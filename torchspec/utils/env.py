@@ -23,6 +23,8 @@ _TORCHSPEC_ENV_KEYS = [
     "TP_SOCKET_IFNAME",
     "CUTE_DSL_CACHE_DIR",
     "TORCHSPEC_FLASH_ATTN_OPT_LEVEL",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "SGLANG_JIT_DEEPGEMM_FAST_WARMUP",
 ]
 
 # Prevent Ray from overriding VISIBLE_DEVICES so actors manage GPU assignment themselves.
