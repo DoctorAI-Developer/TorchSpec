@@ -35,7 +35,15 @@ import torch.nn.functional as F
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
 from torchspec.utils.logging import logger
 
-_VALID_DFLASH_LOSS_OBJECTIVES = {"auf", "decay", "dpace", "lk", "path", "tv"}
+_VALID_DFLASH_LOSS_OBJECTIVES = {
+    "auf",
+    "decay",
+    "dpace",
+    "lk",
+    "opd",
+    "path",
+    "tv",
+}
 
 
 def _distribution_overlap(
@@ -77,6 +85,42 @@ def _total_variation_loss(
 ) -> torch.Tensor:
     """Directly maximize one-step acceptance via total variation distance."""
     return 1.0 - _distribution_overlap(draft_logits, target_logits)
+
+
+def _bernoulli_forward_kl_loss(
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Forward KL for the sampled target-token event and its complement.
+
+    Draft-OPD rollouts are target-distributed.  At an accepted/error-position
+    replay label, the emitted target token therefore supplies an on-policy
+    forward-KL sample.  The local Bernoulli form matches Draft-OPD's public
+    implementation while requiring only the selected token probability from
+    each normalized full-vocabulary distribution.
+    """
+
+    if draft_logits.shape != target_logits.shape:
+        raise ValueError("draft and target logits must have identical shapes")
+    if target_ids.shape != draft_logits.shape[:-1]:
+        raise ValueError("target IDs must match the logits prefix shape")
+    draft_log_probs = torch.log_softmax(draft_logits.float(), dim=-1)
+    with torch.no_grad():
+        target_log_probs = torch.log_softmax(target_logits.float(), dim=-1)
+    gather_ids = target_ids.to(dtype=torch.long).unsqueeze(-1)
+    draft_logp = torch.gather(draft_log_probs, -1, gather_ids).squeeze(-1)
+    target_logp = torch.gather(target_log_probs, -1, gather_ids).squeeze(-1)
+
+    eps = torch.finfo(draft_logp.dtype).eps
+    max_log_prob = torch.log(draft_logp.new_tensor(1.0 - eps))
+    draft_logp = draft_logp.clamp(min=-80.0, max=max_log_prob)
+    target_logp = target_logp.clamp(min=-80.0, max=max_log_prob)
+    draft_prob = draft_logp.exp()
+    target_prob = target_logp.exp()
+    return target_prob * (target_logp - draft_logp) + (1.0 - target_prob) * (
+        torch.log1p(-target_prob) - torch.log1p(-draft_prob)
+    )
 
 
 def _auf_position_mask(
@@ -211,6 +255,8 @@ class DFlashModel(nn.Module):
         loss_decay_gamma: float = 7.0,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
+        opd_rejected_stream_weight: float = 1.0,
+        opd_rejected_position_decay: float = 0.8,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -230,7 +276,13 @@ class DFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
-        if self.loss_objective in {"lk", "path", "tv"}:
+        self.opd_rejected_stream_weight = float(opd_rejected_stream_weight)
+        self.opd_rejected_position_decay = float(opd_rejected_position_decay)
+        if self.opd_rejected_stream_weight < 0:
+            raise ValueError("opd_rejected_stream_weight must be non-negative")
+        if not 0 < self.opd_rejected_position_decay <= 1:
+            raise ValueError("opd_rejected_position_decay must be in (0, 1]")
+        if self.loss_objective in {"lk", "opd", "path", "tv"}:
             objective_name = self.loss_objective.upper()
             if self.ce_loss_alpha != 0:
                 raise ValueError(
@@ -246,7 +298,12 @@ class DFlashModel(nn.Module):
 
     @property
     def uses_target_hidden_states(self) -> bool:
-        return self.l1_loss_alpha > 0 or self.loss_objective in {"lk", "path", "tv"}
+        return self.l1_loss_alpha > 0 or self.loss_objective in {
+            "lk",
+            "opd",
+            "path",
+            "tv",
+        }
 
     def _sample_anchor_positions(
         self,
@@ -315,6 +372,56 @@ class DFlashModel(nn.Module):
         anchors = torch.where(keep_mask, anchors, 0)
 
         return anchors, keep_mask
+
+    def _prepare_opd_anchor_plan(
+        self,
+        *,
+        seq_len: int,
+        batch_size: int,
+        device: torch.device,
+        anchor_positions: torch.Tensor | None,
+        anchor_mask: torch.Tensor | None,
+        segment_lengths: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Validate and pad a recorded error-position replay plan."""
+
+        values = (anchor_positions, anchor_mask, segment_lengths)
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise ValueError("DFlash OPD anchor positions, mask, and segments are atomic")
+        anchor_positions = anchor_positions.to(device=device, dtype=torch.long)
+        anchor_mask = anchor_mask.to(device=device, dtype=torch.bool)
+        segment_lengths = segment_lengths.to(device=device, dtype=torch.long)
+        if not (
+            anchor_positions.shape == anchor_mask.shape == segment_lengths.shape
+            and anchor_positions.dim() == 2
+            and anchor_positions.shape[0] == batch_size
+        ):
+            raise ValueError("DFlash OPD anchor tensors must be matching [batch, anchors]")
+        if anchor_positions.shape[1] > self.num_anchors:
+            raise ValueError(
+                "DFlash OPD replay contains more anchors than dflash_num_anchors: "
+                f"{anchor_positions.shape[1]} > {self.num_anchors}"
+            )
+        if bool((anchor_mask & ((anchor_positions < 0) | (anchor_positions >= seq_len))).any()):
+            raise ValueError("DFlash OPD anchor position is outside the sequence")
+        if bool(
+            (anchor_mask & ((segment_lengths < 0) | (segment_lengths >= self.block_size))).any()
+        ):
+            raise ValueError("DFlash OPD segment length is outside the draft block")
+        for row_positions, row_mask in zip(anchor_positions, anchor_mask, strict=True):
+            valid_positions = row_positions[row_mask]
+            if valid_positions.numel() != torch.unique(valid_positions).numel():
+                raise ValueError("DFlash OPD replay contains duplicate anchors")
+
+        anchor_positions = torch.where(
+            anchor_mask, anchor_positions, torch.zeros_like(anchor_positions)
+        )
+        segment_lengths = torch.where(
+            anchor_mask, segment_lengths, torch.zeros_like(segment_lengths)
+        )
+        return anchor_positions, anchor_mask, segment_lengths
 
     def _create_position_ids(
         self, anchor_positions: torch.Tensor, seq_len: int
@@ -397,17 +504,150 @@ class DFlashModel(nn.Module):
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
         distribution_loss = None
-        if self.loss_objective in {"lk", "path", "tv"}:
+        if self.loss_objective in {"lk", "opd", "path", "tv"}:
             if aligned_target_hidden is None:
                 raise ValueError(
                     "DFlash distribution training requires aligned target hidden states"
                 )
             target_logits = F.linear(aligned_target_hidden, lm_head_weight)
-            objective = (
-                _total_variation_loss if self.loss_objective == "tv" else _likelihood_overlap_loss
-            )
-            distribution_loss = objective(flat_logits, target_logits.reshape_as(flat_logits))
+            target_logits = target_logits.reshape_as(flat_logits)
+            if self.loss_objective == "tv":
+                distribution_loss = _total_variation_loss(flat_logits, target_logits)
+            elif self.loss_objective == "opd":
+                distribution_loss = _bernoulli_forward_kl_loss(
+                    flat_logits, target_logits, flat_targets
+                )
+            else:
+                distribution_loss = _likelihood_overlap_loss(flat_logits, target_logits)
         return ce_per_token, pred_ids, logits, distribution_loss
+
+    def _selected_token_log_probs(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize the full vocabulary and return selected-token logprobs."""
+
+        if hidden_states.dim() != 2 or token_ids.shape != hidden_states.shape[:1]:
+            raise ValueError("selected hidden states and token IDs must be [tokens, hidden]")
+        logits = self._compute_logits(hidden_states, lm_head_weight)
+        return torch.gather(
+            torch.log_softmax(logits.float(), dim=-1),
+            -1,
+            token_ids.to(dtype=torch.long).unsqueeze(-1),
+        ).squeeze(-1)
+
+    def _opd_rejected_loss(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        rejected_anchor_positions: torch.Tensor | None,
+        rejected_offsets: torch.Tensor | None,
+        rejected_token_ids: torch.Tensor | None,
+        rejected_teacher_logprobs: torch.Tensor | None,
+        rejected_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """Replay rejected draft suffixes with Draft-OPD's reverse-KL K3 loss."""
+
+        rejected_values = (
+            rejected_anchor_positions,
+            rejected_offsets,
+            rejected_token_ids,
+            rejected_teacher_logprobs,
+            rejected_mask,
+        )
+        zero = draft_hidden.new_zeros((), dtype=torch.float32)
+        if all(value is None for value in rejected_values):
+            if self.loss_objective == "opd":
+                raise ValueError("DFlash OPD objective requires rejected draft metadata")
+            return zero, zero.detach(), {}
+        if any(value is None for value in rejected_values):
+            raise ValueError("DFlash OPD rejected draft metadata is atomic")
+        if self.loss_objective != "opd":
+            raise ValueError("rejected OPD tokens require dflash_loss_objective=opd")
+
+        device = draft_hidden.device
+        rejected_anchor_positions = rejected_anchor_positions.to(device=device, dtype=torch.long)
+        rejected_offsets = rejected_offsets.to(device=device, dtype=torch.long)
+        rejected_token_ids = rejected_token_ids.to(device=device, dtype=torch.long)
+        rejected_teacher_logprobs = rejected_teacher_logprobs.to(device=device, dtype=torch.float32)
+        rejected_mask = rejected_mask.to(device=device, dtype=torch.bool)
+        rejected_shape = rejected_mask.shape
+        if rejected_mask.dim() != 2 or any(
+            value.shape != rejected_shape
+            for value in (
+                rejected_anchor_positions,
+                rejected_offsets,
+                rejected_token_ids,
+                rejected_teacher_logprobs,
+            )
+        ):
+            raise ValueError("DFlash OPD rejected tensors must be matching [batch, tokens]")
+        if rejected_shape[0] != draft_hidden.shape[0]:
+            raise ValueError("DFlash OPD rejected batch size does not match draft hidden states")
+        if not bool(rejected_mask.any()):
+            return zero, zero.detach(), {"opd_rejected_loss": (zero.detach(), zero.detach())}
+        if bool(
+            (
+                rejected_mask & ((rejected_offsets <= 0) | (rejected_offsets >= self.block_size))
+            ).any()
+        ):
+            raise ValueError("DFlash OPD rejected offset is outside the draft block")
+        vocab_size = lm_head_weight.shape[0]
+        if bool(
+            (rejected_mask & ((rejected_token_ids < 0) | (rejected_token_ids >= vocab_size))).any()
+        ):
+            raise ValueError("DFlash OPD rejected token ID is outside the vocabulary")
+        if bool(
+            (
+                rejected_mask
+                & (~torch.isfinite(rejected_teacher_logprobs) | (rejected_teacher_logprobs > 1e-6))
+            ).any()
+        ):
+            raise ValueError("DFlash OPD rejected teacher logprob is invalid")
+
+        anchor_matches = (
+            anchor_positions.unsqueeze(-1) == rejected_anchor_positions.unsqueeze(1)
+        ) & block_keep_mask.unsqueeze(-1)
+        match_count = anchor_matches.sum(dim=1)
+        if bool((rejected_mask & match_count.ne(1)).any()):
+            raise ValueError("DFlash OPD rejected token does not match exactly one anchor")
+        block_indices = anchor_matches.to(dtype=torch.long).argmax(dim=1)
+        draft_indices = block_indices * self.block_size + rejected_offsets
+        safe_draft_indices = torch.where(
+            rejected_mask, draft_indices, torch.zeros_like(draft_indices)
+        )
+        hidden_size = draft_hidden.shape[-1]
+        selected_hidden = torch.gather(
+            draft_hidden,
+            1,
+            safe_draft_indices.unsqueeze(-1).expand(-1, -1, hidden_size),
+        )[rejected_mask]
+        selected_token_ids = rejected_token_ids[rejected_mask]
+        student_logprobs = self._selected_token_log_probs(
+            selected_hidden,
+            lm_head_weight,
+            selected_token_ids,
+        )
+        teacher_logprobs = rejected_teacher_logprobs[rejected_mask]
+
+        # Schulman's non-negative K3 estimator, matching Draft-OPD. These
+        # rejected tokens were sampled by the draft distribution, so reverse
+        # KL is the correct on-policy direction for this stream.
+        delta = (teacher_logprobs - student_logprobs).clamp(min=-20.0, max=20.0)
+        rejected_losses = (delta.exp() - delta - 1.0).clamp(min=-10.0, max=10.0)
+        offsets = rejected_offsets[rejected_mask].to(dtype=torch.float32)
+        weights = torch.pow(
+            offsets.new_tensor(self.opd_rejected_position_decay),
+            (offsets - 1.0).clamp_min(0.0),
+        )
+        numerator = (rejected_losses * weights).sum()
+        denominator = weights.sum().detach()
+        return numerator, denominator, {"opd_rejected_loss": (numerator.detach(), denominator)}
 
     def _extra_training_loss(
         self,
@@ -424,6 +664,8 @@ class DFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states_list: List[torch.Tensor],
         loss_mask: torch.Tensor,
+        anchor_positions: torch.Tensor | None = None,
+        block_keep_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
         Shared DFlash backbone (context features → anchor sampling → noise
@@ -446,9 +688,12 @@ class DFlashModel(nn.Module):
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
 
         # 2. Sample anchor positions with validity mask
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
-        )
+        if anchor_positions is None and block_keep_mask is None:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device
+            )
+        elif anchor_positions is None or block_keep_mask is None:
+            raise ValueError("explicit DFlash anchors and keep mask must be provided together")
         n_blocks = anchor_positions.shape[1]
 
         # 3. Create noise embeddings (anchor token + MASK tokens)
@@ -500,6 +745,14 @@ class DFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         last_hidden_states: Optional[torch.Tensor] = None,
+        opd_anchor_positions: Optional[torch.Tensor] = None,
+        opd_anchor_mask: Optional[torch.Tensor] = None,
+        opd_segment_lengths: Optional[torch.Tensor] = None,
+        opd_rejected_anchor_positions: Optional[torch.Tensor] = None,
+        opd_rejected_offsets: Optional[torch.Tensor] = None,
+        opd_rejected_token_ids: Optional[torch.Tensor] = None,
+        opd_rejected_teacher_logprobs: Optional[torch.Tensor] = None,
+        opd_rejected_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -531,8 +784,29 @@ class DFlashModel(nn.Module):
         device = input_ids.device
 
         # 1-6. Shared backbone → draft hidden states + anchor bookkeeping.
+        opd_plan = self._prepare_opd_anchor_plan(
+            seq_len=seq_len,
+            batch_size=bsz,
+            device=device,
+            anchor_positions=opd_anchor_positions,
+            anchor_mask=opd_anchor_mask,
+            segment_lengths=opd_segment_lengths,
+        )
+        active_segment_lengths = None
+        explicit_anchor_positions = None
+        explicit_anchor_mask = None
+        if opd_plan is not None:
+            explicit_anchor_positions, explicit_anchor_mask, active_segment_lengths = opd_plan
+        if self.loss_objective == "opd" and opd_plan is None:
+            raise ValueError("DFlash OPD objective requires recorded error-position anchors")
+        if self.loss_objective != "opd" and opd_plan is not None:
+            raise ValueError("recorded OPD anchors require dflash_loss_objective=opd")
         draft_hidden, anchor_positions, block_keep_mask, n_blocks = self._draft_backbone(
-            input_ids, hidden_states_list, loss_mask
+            input_ids,
+            hidden_states_list,
+            loss_mask,
+            anchor_positions=explicit_anchor_positions,
+            block_keep_mask=explicit_anchor_mask,
         )
 
         # 7. Compute labels and weight mask (SpecForge pattern)
@@ -553,7 +827,7 @@ class DFlashModel(nn.Module):
             if last_hidden_states is None:
                 requirement = (
                     f"DFlash {self.loss_objective.upper()}"
-                    if self.loss_objective in {"lk", "path", "tv"}
+                    if self.loss_objective in {"lk", "opd", "path", "tv"}
                     else "DFlash L1 distillation (l1_loss_alpha > 0)"
                 )
                 raise ValueError(
@@ -581,6 +855,11 @@ class DFlashModel(nn.Module):
         pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
         weight_mask = weight_mask * (pos_in_block > 0).float()
 
+        if active_segment_lengths is not None:
+            weight_mask = weight_mask * (pos_in_block <= active_segment_lengths.unsqueeze(-1)).to(
+                dtype=weight_mask.dtype
+            )
+
         # Gather original loss_mask at label positions
         original_loss_mask_gathered = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, n_blocks, -1),
@@ -601,7 +880,7 @@ class DFlashModel(nn.Module):
         # D-PACE-style expected-prefix value to LK below.
         flat_targets = target_ids.view(-1)
 
-        if self.loss_objective in {"lk", "path", "tv"}:
+        if self.loss_objective in {"lk", "opd", "path", "tv"}:
             if distribution_loss is None:
                 raise RuntimeError(
                     "DFlash distribution token statistics did not return overlap loss"
@@ -673,6 +952,23 @@ class DFlashModel(nn.Module):
             native_weights=weight_mask,
         )
         loss_numerator = loss_numerator + extra_numerator
+        rejected_numerator, rejected_denominator, rejected_components = self._opd_rejected_loss(
+            draft_hidden=draft_hidden,
+            lm_head_weight=lm_head_weight,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            rejected_anchor_positions=opd_rejected_anchor_positions,
+            rejected_offsets=opd_rejected_offsets,
+            rejected_token_ids=opd_rejected_token_ids,
+            rejected_teacher_logprobs=opd_rejected_teacher_logprobs,
+            rejected_mask=opd_rejected_mask,
+        )
+        if self.loss_objective == "opd":
+            loss_numerator = loss_numerator + self.opd_rejected_stream_weight * rejected_numerator
+            loss_denominator = (
+                loss_denominator + self.opd_rejected_stream_weight * rejected_denominator
+            )
+            loss_components.update(rejected_components)
         loss = loss_numerator / loss_denominator.clamp(min=1e-6)
 
         # 10. Accuracy (using binary mask without decay)

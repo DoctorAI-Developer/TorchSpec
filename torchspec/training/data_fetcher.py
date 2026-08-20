@@ -25,6 +25,8 @@ Data flow:
                 iter(fetcher)          queue.get()      store.get(key)     pad & batch
 """
 
+import json
+import math
 import queue
 import threading
 from dataclasses import dataclass
@@ -54,6 +56,127 @@ class TrainSample:
     last_turn_loss_only: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
     data_id: Optional[str] = None
+
+
+def decode_dflash_opd_replay_metadata(
+    metadata: Dict[str, Any] | None,
+    *,
+    sequence_length: int,
+) -> Dict[str, torch.Tensor]:
+    """Decode the scalar Draft-OPD replay envelope stored with a sample.
+
+    OfflineDataset deliberately keeps its tensor schema small.  Pretokenized
+    callers can still carry structured provenance as a canonical JSON string;
+    this helper validates that envelope and materializes the small anchor and
+    rejected-suffix tensors only when the sample enters training.
+    """
+
+    raw = (metadata or {}).get("opd_replay_json")
+    if raw is None:
+        return {}
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("opd_replay_json must be a non-empty JSON string")
+    try:
+        replay = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("opd_replay_json is invalid JSON") from exc
+    if not isinstance(replay, dict) or replay.get("schema_version") != 1:
+        raise ValueError("unsupported DFlash OPD replay schema")
+
+    block_size = int(replay.get("block_size", 0))
+    prompt_length = int(replay.get("prompt_length", 0))
+    response_length = int(replay.get("response_length", 0))
+    if block_size < 2 or prompt_length < 1 or response_length < 1:
+        raise ValueError("invalid DFlash OPD replay geometry")
+    if prompt_length + response_length != sequence_length:
+        raise ValueError(
+            "DFlash OPD replay sequence length mismatch: "
+            f"{prompt_length}+{response_length}!={sequence_length}"
+        )
+
+    plans = replay.get("anchor_plan")
+    suffix = replay.get("rejected_suffix")
+    if not isinstance(plans, list) or not isinstance(suffix, dict):
+        raise ValueError("DFlash OPD replay is missing anchor_plan or rejected_suffix")
+
+    # Preserve official response anchors, then add suffix-only anchors in first
+    # occurrence order.  An accepted segment can share an anchor with multiple
+    # rejected suffix tokens; one draft forward serves both streams.
+    segment_by_anchor: dict[int, int] = {}
+    for index, plan in enumerate(plans):
+        if not isinstance(plan, dict):
+            raise ValueError(f"DFlash OPD anchor plan {index} is not an object")
+        response_anchor = int(plan.get("anchor_response_index", -2))
+        segment_length = int(plan.get("segment_length", -1))
+        full_anchor = (
+            prompt_length - 1 if response_anchor == -1 else prompt_length + response_anchor
+        )
+        if (
+            response_anchor < -1
+            or response_anchor >= response_length
+            or full_anchor < 0
+            or full_anchor >= sequence_length
+            or segment_length <= 0
+            or segment_length >= block_size
+        ):
+            raise ValueError(f"invalid DFlash OPD accepted anchor plan at index {index}")
+        if full_anchor in segment_by_anchor:
+            raise ValueError(f"duplicate DFlash OPD accepted anchor {full_anchor}")
+        segment_by_anchor[full_anchor] = segment_length
+
+    suffix_keys = ("anchor_indices", "offsets", "token_ids", "teacher_logprobs")
+    suffix_values = {key: suffix.get(key) for key in suffix_keys}
+    if any(not isinstance(value, list) for value in suffix_values.values()):
+        raise ValueError("DFlash OPD rejected suffix fields must be lists")
+    suffix_lengths = {key: len(value) for key, value in suffix_values.items()}
+    if len(set(suffix_lengths.values())) != 1:
+        raise ValueError(f"DFlash OPD rejected suffix length mismatch: {suffix_lengths}")
+
+    rejected_full_anchors: list[int] = []
+    rejected_offsets: list[int] = []
+    rejected_token_ids: list[int] = []
+    rejected_teacher_logprobs: list[float] = []
+    for index, values in enumerate(zip(*(suffix_values[key] for key in suffix_keys), strict=True)):
+        response_anchor, offset, token_id, teacher_logprob = values
+        response_anchor = int(response_anchor)
+        offset = int(offset)
+        token_id = int(token_id)
+        teacher_logprob = float(teacher_logprob)
+        full_anchor = (
+            prompt_length - 1 if response_anchor == -1 else prompt_length + response_anchor
+        )
+        if (
+            response_anchor < -1
+            or response_anchor >= response_length
+            or full_anchor < 0
+            or full_anchor >= sequence_length
+            or offset <= 0
+            or offset >= block_size
+            or token_id < 0
+            or not math.isfinite(teacher_logprob)
+            or teacher_logprob > 1e-6
+        ):
+            raise ValueError(f"invalid DFlash OPD rejected suffix token at index {index}")
+        segment_by_anchor.setdefault(full_anchor, 0)
+        rejected_full_anchors.append(full_anchor)
+        rejected_offsets.append(offset)
+        rejected_token_ids.append(token_id)
+        rejected_teacher_logprobs.append(teacher_logprob)
+
+    anchors = list(segment_by_anchor)
+    segments = [segment_by_anchor[anchor] for anchor in anchors]
+    return {
+        "opd_anchor_positions": torch.tensor([anchors], dtype=torch.long),
+        "opd_anchor_mask": torch.ones((1, len(anchors)), dtype=torch.bool),
+        "opd_segment_lengths": torch.tensor([segments], dtype=torch.long),
+        "opd_rejected_anchor_positions": torch.tensor([rejected_full_anchors], dtype=torch.long),
+        "opd_rejected_offsets": torch.tensor([rejected_offsets], dtype=torch.long),
+        "opd_rejected_token_ids": torch.tensor([rejected_token_ids], dtype=torch.long),
+        "opd_rejected_teacher_logprobs": torch.tensor(
+            [rejected_teacher_logprobs], dtype=torch.float32
+        ),
+        "opd_rejected_mask": torch.ones((1, len(rejected_offsets)), dtype=torch.bool),
+    }
 
 
 class MooncakeDataset(IterableDataset):
@@ -169,6 +292,14 @@ class MooncakeDataset(IterableDataset):
             result["packed_loss_mask"] = sample.packed_loss_mask
         if sample.last_turn_loss_only is not None:
             result["last_turn_loss_only"] = sample.last_turn_loss_only
+        input_ids = result.get("input_ids")
+        if isinstance(input_ids, torch.Tensor):
+            result.update(
+                decode_dflash_opd_replay_metadata(
+                    sample.metadata,
+                    sequence_length=int(input_ids.numel()),
+                )
+            )
         return result
 
     def _load_vllm_pp_layers(

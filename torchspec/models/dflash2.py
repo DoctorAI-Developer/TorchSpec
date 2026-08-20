@@ -28,6 +28,7 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from torchspec.models.dflash import (
     DFlashModel,
+    _bernoulli_forward_kl_loss,
     _likelihood_overlap_loss,
     _total_variation_loss,
 )
@@ -160,18 +161,20 @@ class DFlash2Model(DFlashModel):
                 reduction="none",
             ).reshape_as(target_indices)
             distribution_loss = ce.new_empty(0)
-            if self.loss_objective in {"lk", "path", "tv"}:
+            if self.loss_objective in {"lk", "opd", "path", "tv"}:
                 if target_hidden is None:
                     raise ValueError(
                         "DFlash distribution training requires aligned target hidden states"
                     )
                 target_logits = F.linear(target_hidden, lm_head_weight)
-                objective = (
-                    _total_variation_loss
-                    if self.loss_objective == "tv"
-                    else _likelihood_overlap_loss
-                )
-                distribution_loss = objective(chunk_logits, target_logits)
+                if self.loss_objective == "tv":
+                    distribution_loss = _total_variation_loss(chunk_logits, target_logits)
+                elif self.loss_objective == "opd":
+                    distribution_loss = _bernoulli_forward_kl_loss(
+                        chunk_logits, target_logits, targets
+                    )
+                else:
+                    distribution_loss = _likelihood_overlap_loss(chunk_logits, target_logits)
             return ce, pred, selector_ce, distribution_loss
 
         for start in range(0, num_blocks, blocks_per_chunk):
@@ -198,7 +201,7 @@ class DFlash2Model(DFlashModel):
             ce_chunks.append(ce)
             pred_chunks.append(pred)
             selector_ce_chunks.append(selector_ce)
-            if self.loss_objective in {"lk", "path", "tv"}:
+            if self.loss_objective in {"lk", "opd", "path", "tv"}:
                 distribution_loss_chunks.append(distribution_loss)
 
         ce_per_token = torch.cat(ce_chunks, dim=1).reshape(-1)
@@ -210,6 +213,26 @@ class DFlash2Model(DFlashModel):
             else None
         )
         return ce_per_token, pred_ids, selector_ce, distribution_loss
+
+    def _selected_token_log_probs(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.logits_chunk_size == 0 or hidden_states.shape[0] <= self.logits_chunk_size:
+            return super()._selected_token_log_probs(hidden_states, lm_head_weight, token_ids)
+        chunks = []
+        for start in range(0, hidden_states.shape[0], self.logits_chunk_size):
+            stop = min(start + self.logits_chunk_size, hidden_states.shape[0])
+            chunks.append(
+                super()._selected_token_log_probs(
+                    hidden_states[start:stop],
+                    lm_head_weight,
+                    token_ids[start:stop],
+                )
+            )
+        return torch.cat(chunks)
 
     def _extra_training_loss(
         self,

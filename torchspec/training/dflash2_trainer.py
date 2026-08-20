@@ -29,12 +29,14 @@ from torchspec.training.dflash_trainer import DFlashTrainer
 
 class DFlash2Trainer(DFlashTrainer):
     _draft_config_class = DFlash2Config
-    _extra_loss_component_keys = ["selector_loss"]
+    _extra_loss_component_keys = ["selector_loss", "opd_rejected_loss"]
 
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.logits_chunk_size = getattr(args, "dflash2_logits_chunk_size", 0)
         self.selector_loss_alpha = getattr(args, "dflash2_selector_loss_alpha", 1.0)
+        self.opd_rejected_stream_weight = getattr(args, "dflash2_opd_rejected_stream_weight", 1.0)
+        self.opd_rejected_position_decay = getattr(args, "dflash2_opd_rejected_position_decay", 0.8)
 
     def _build_draft_model(self, config):
         if config.block_size != self.block_size:
@@ -62,4 +64,6 @@ class DFlash2Trainer(DFlashTrainer):
             l1_loss_alpha=self.l1_loss_alpha,
             logits_chunk_size=self.logits_chunk_size,
             selector_loss_alpha=self.selector_loss_alpha,
+            opd_rejected_stream_weight=self.opd_rejected_stream_weight,
+            opd_rejected_position_decay=self.opd_rejected_position_decay,
         )

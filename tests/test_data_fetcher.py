@@ -1,5 +1,6 @@
 """Tests for MooncakeDataFetcher and create_mooncake_dataloader."""
 
+import json
 import queue
 import time
 from typing import Dict, List, Tuple
@@ -7,12 +8,17 @@ from typing import Dict, List, Tuple
 import pytest
 import torch
 
-from torchspec.data.utils import pack_loss_mask, serialize_packed_loss_mask
+from torchspec.data.utils import (
+    DataCollatorWithPadding,
+    pack_loss_mask,
+    serialize_packed_loss_mask,
+)
 from torchspec.training.data_fetcher import (
     MooncakeDataFetcher,
     MooncakeDataset,
     TrainSample,
     create_mooncake_dataloader,
+    decode_dflash_opd_replay_metadata,
 )
 
 
@@ -112,6 +118,90 @@ def make_sample(idx: int) -> TrainSample:
 
 
 class TestMooncakeDataset:
+    @staticmethod
+    def _opd_metadata(*, second_anchor: bool = True) -> dict:
+        anchor_plan = [
+            {
+                "anchor_response_index": -1,
+                "boundary_response_index": 2,
+                "segment_length": 3,
+            }
+        ]
+        if second_anchor:
+            anchor_plan.append(
+                {
+                    "anchor_response_index": 2,
+                    "boundary_response_index": 4,
+                    "segment_length": 2,
+                }
+            )
+        return {
+            "opd_replay_json": json.dumps(
+                {
+                    "schema_version": 1,
+                    "block_size": 8,
+                    "prompt_length": 3,
+                    "response_length": 5,
+                    "anchor_plan": anchor_plan,
+                    "rejected_suffix": {
+                        "anchor_indices": [0, 2],
+                        "offsets": [1, 3],
+                        "token_ids": [17, 23],
+                        "teacher_logprobs": [-1.5, -2.75],
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        }
+
+    def test_decodes_dflash_opd_replay_into_batched_tensors(self):
+        decoded = decode_dflash_opd_replay_metadata(
+            self._opd_metadata(),
+            sequence_length=8,
+        )
+
+        # Accepted anchors are prompt-1 and prompt+2; suffix anchor prompt+0
+        # is appended once so one draft forward serves both OPD streams.
+        assert decoded["opd_anchor_positions"].tolist() == [[2, 5, 3]]
+        assert decoded["opd_segment_lengths"].tolist() == [[3, 2, 0]]
+        assert decoded["opd_rejected_anchor_positions"].tolist() == [[3, 5]]
+        assert decoded["opd_rejected_offsets"].tolist() == [[1, 3]]
+        assert decoded["opd_rejected_teacher_logprobs"].tolist() == [[-1.5, -2.75]]
+
+    def test_opd_collator_pads_anchor_and_rejected_streams(self):
+        first = {
+            "input_ids": torch.arange(8).unsqueeze(0),
+            "loss_mask": torch.ones(1, 8),
+            **decode_dflash_opd_replay_metadata(self._opd_metadata(), sequence_length=8),
+        }
+        second_metadata = self._opd_metadata(second_anchor=False)
+        second_replay = json.loads(second_metadata["opd_replay_json"])
+        for key in ("anchor_indices", "offsets", "token_ids", "teacher_logprobs"):
+            second_replay["rejected_suffix"][key] = second_replay["rejected_suffix"][key][:1]
+        second_metadata["opd_replay_json"] = json.dumps(second_replay)
+        second = {
+            "input_ids": torch.arange(8).unsqueeze(0),
+            "loss_mask": torch.ones(1, 8),
+            **decode_dflash_opd_replay_metadata(second_metadata, sequence_length=8),
+        }
+
+        batch = DataCollatorWithPadding()([first, second])
+
+        assert batch["opd_anchor_positions"].shape == (2, 3)
+        assert batch["opd_anchor_mask"].tolist() == [
+            [True, True, True],
+            [True, True, False],
+        ]
+        assert batch["opd_rejected_offsets"].shape == (2, 2)
+
+    def test_opd_decoder_fails_closed_on_sequence_mismatch(self):
+        with pytest.raises(ValueError, match="sequence length mismatch"):
+            decode_dflash_opd_replay_metadata(
+                self._opd_metadata(),
+                sequence_length=9,
+            )
+
     def test_iterates_samples(self):
         ray_queue = MockRayQueue()
         store = MockMooncakeStore()

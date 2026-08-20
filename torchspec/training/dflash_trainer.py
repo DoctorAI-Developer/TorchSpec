@@ -149,9 +149,7 @@ class DFlashTrainer(Trainer):
         draft_model = draft_model.to(torch.bfloat16)
         # Enable gradient checkpointing from config (cuts backward activation
         # memory ~60-80%, which is required for colocated training on one GPU).
-        draft_model.gradient_checkpointing = getattr(
-            self.args, "gradient_checkpointing", False
-        )
+        draft_model.gradient_checkpointing = getattr(self.args, "gradient_checkpointing", False)
 
         dist.barrier(group=get_gloo_group())
 
@@ -313,6 +311,22 @@ class DFlashTrainer(Trainer):
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
+        opd_keys = (
+            "opd_anchor_positions",
+            "opd_anchor_mask",
+            "opd_segment_lengths",
+            "opd_rejected_anchor_positions",
+            "opd_rejected_offsets",
+            "opd_rejected_token_ids",
+            "opd_rejected_teacher_logprobs",
+            "opd_rejected_mask",
+        )
+        opd_tensors = {
+            key: value.to(device, non_blocking=True)
+            for key in opd_keys
+            if (value := batch.get(key)) is not None
+        }
+
         (
             loss,
             accuracy,
@@ -327,6 +341,14 @@ class DFlashTrainer(Trainer):
             loss_mask=loss_mask,
             lm_head_weight=self.target_lm_head_weight,
             last_hidden_states=last_hidden_states,
+            opd_anchor_positions=opd_tensors.get("opd_anchor_positions"),
+            opd_anchor_mask=opd_tensors.get("opd_anchor_mask"),
+            opd_segment_lengths=opd_tensors.get("opd_segment_lengths"),
+            opd_rejected_anchor_positions=opd_tensors.get("opd_rejected_anchor_positions"),
+            opd_rejected_offsets=opd_tensors.get("opd_rejected_offsets"),
+            opd_rejected_token_ids=opd_tensors.get("opd_rejected_token_ids"),
+            opd_rejected_teacher_logprobs=opd_tensors.get("opd_rejected_teacher_logprobs"),
+            opd_rejected_mask=opd_tensors.get("opd_rejected_mask"),
         )
 
         return (

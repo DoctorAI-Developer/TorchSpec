@@ -37,7 +37,11 @@ from tools.convert_to_hf import (
     _remap_weight_keys,
     _save_without_vocab_pruning,
 )
-from torchspec.models.dflash import _create_dflash_mask_mod, _dpace_position_weights
+from torchspec.models.dflash import (
+    _bernoulli_forward_kl_loss,
+    _create_dflash_mask_mod,
+    _dpace_position_weights,
+)
 from torchspec.models.dflash2 import DFlash2Model
 from torchspec.models.draft.auto import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
@@ -716,6 +720,130 @@ class TestDFlash2Forward(unittest.TestCase):
                             ),
                             msg=name,
                         )
+
+    def test_opd_chunked_replay_matches_full_loss_and_gradients(self):
+        full_model = _make_model(
+            logits_chunk_size=0,
+            loss_objective="opd",
+            ce_loss_alpha=0,
+        )
+        chunked_model = _make_model(
+            logits_chunk_size=4,
+            loss_objective="opd",
+            ce_loss_alpha=0,
+        )
+        chunked_model.load_state_dict(full_model.state_dict())
+        batch = _batch(seed=41, with_last_hidden_states=True)
+        batch.update(
+            {
+                "opd_anchor_positions": torch.tensor([[1, 5], [2, 6]]),
+                "opd_anchor_mask": torch.tensor([[True, True], [True, True]]),
+                "opd_segment_lengths": torch.tensor([[3, 2], [2, 3]]),
+                "opd_rejected_anchor_positions": torch.tensor([[1, 5, 5], [2, 6, 0]]),
+                "opd_rejected_offsets": torch.tensor([[1, 2, 3], [3, 1, 0]]),
+                "opd_rejected_token_ids": torch.tensor([[3, 7, 11], [5, 13, 0]]),
+                "opd_rejected_teacher_logprobs": torch.tensor(
+                    [[-1.2, -2.3, -3.4], [-0.7, -4.1, 0.0]]
+                ),
+                "opd_rejected_mask": torch.tensor([[True, True, True], [True, True, False]]),
+            }
+        )
+
+        full_result = full_model(**batch)
+        chunked_result = chunked_model(**batch)
+
+        for full_value, chunked_value in zip(full_result[:5], chunked_result[:5]):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        self.assertEqual(full_result[5].keys(), chunked_result[5].keys())
+        for key in full_result[5]:
+            for full_value, chunked_value in zip(full_result[5][key], chunked_result[5][key]):
+                self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        for full_value, chunked_value in zip(full_result[6], chunked_result[6]):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+
+        full_result[0].backward()
+        chunked_result[0].backward()
+        chunked_parameters = dict(chunked_model.named_parameters())
+        for name, full_parameter in full_model.named_parameters():
+            chunked_parameter = chunked_parameters[name]
+            if full_parameter.grad is None:
+                self.assertIsNone(chunked_parameter.grad, msg=name)
+            else:
+                self.assertTrue(
+                    torch.allclose(
+                        full_parameter.grad,
+                        chunked_parameter.grad,
+                        atol=1e-5,
+                        rtol=1e-5,
+                    ),
+                    msg=name,
+                )
+
+    def test_opd_rejected_stream_uses_k3_and_position_decay(self):
+        model = _make_model(loss_objective="opd", ce_loss_alpha=0)
+        student_logprobs = torch.tensor([-1.7, -3.2], requires_grad=True)
+        draft_hidden = torch.randn(1, 8, 16, requires_grad=True)
+        lm_head = torch.randn(32, 16)
+
+        with mock.patch.object(
+            model,
+            "_selected_token_log_probs",
+            return_value=student_logprobs,
+        ):
+            numerator, denominator, components = model._opd_rejected_loss(
+                draft_hidden=draft_hidden,
+                lm_head_weight=lm_head,
+                anchor_positions=torch.tensor([[2, 6]]),
+                block_keep_mask=torch.tensor([[True, True]]),
+                rejected_anchor_positions=torch.tensor([[2, 6]]),
+                rejected_offsets=torch.tensor([[1, 3]]),
+                rejected_token_ids=torch.tensor([[4, 9]]),
+                rejected_teacher_logprobs=torch.tensor([[-1.1, -2.5]]),
+                rejected_mask=torch.tensor([[True, True]]),
+            )
+
+        delta = (torch.tensor([-1.1, -2.5]) - student_logprobs).clamp(-20, 20)
+        losses = (delta.exp() - delta - 1).clamp(-10, 10)
+        weights = torch.tensor([1.0, 0.8**2])
+        expected = (losses * weights).sum()
+        self.assertTrue(torch.allclose(numerator, expected))
+        self.assertTrue(torch.allclose(denominator, weights.sum()))
+        self.assertTrue(torch.allclose(components["opd_rejected_loss"][0], expected))
+        numerator.backward()
+        self.assertTrue(torch.isfinite(student_logprobs.grad).all())
+
+    def test_opd_anchor_plan_uses_dynamic_observed_width(self):
+        model = _make_model(loss_objective="opd", ce_loss_alpha=0)
+        model.num_anchors = 8
+
+        positions, keep_mask, segments = model._prepare_opd_anchor_plan(
+            seq_len=12,
+            batch_size=2,
+            device=torch.device("cpu"),
+            anchor_positions=torch.tensor([[2, 7], [3, 0]]),
+            anchor_mask=torch.tensor([[True, True], [True, False]]),
+            segment_lengths=torch.tensor([[3, 2], [1, 0]]),
+        )
+
+        self.assertEqual(positions.shape, (2, 2))
+        self.assertEqual(keep_mask.shape, (2, 2))
+        self.assertEqual(segments.shape, (2, 2))
+
+    def test_opd_local_forward_kl_matches_bernoulli_definition(self):
+        draft_logits = torch.tensor([[0.1, 1.2, -0.4]], requires_grad=True)
+        target_logits = torch.tensor([[0.7, -0.3, 0.2]])
+        target_ids = torch.tensor([2])
+
+        actual = _bernoulli_forward_kl_loss(draft_logits, target_logits, target_ids)
+
+        draft_logp = torch.log_softmax(draft_logits, dim=-1)[0, 2]
+        target_logp = torch.log_softmax(target_logits, dim=-1)[0, 2]
+        expected = target_logp.exp() * (target_logp - draft_logp) + (1 - target_logp.exp()) * (
+            torch.log1p(-target_logp.exp()) - torch.log1p(-draft_logp.exp())
+        )
+        self.assertTrue(torch.allclose(actual, expected.unsqueeze(0), atol=1e-6))
+        actual.sum().backward()
+        self.assertTrue(torch.isfinite(draft_logits.grad).all())
 
     def test_all_masked_batch_has_zero_losses(self):
         loss, _, _, _, _, components, loss_terms = self.model(**_batch(all_masked=True))

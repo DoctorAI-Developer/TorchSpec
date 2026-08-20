@@ -143,6 +143,35 @@ class DataCollatorWithPadding:
                         for item in features
                     ]
                 )
+        opd_anchor_fields = (
+            "opd_anchor_positions",
+            "opd_anchor_mask",
+            "opd_segment_lengths",
+        )
+        opd_rejected_fields = (
+            "opd_rejected_anchor_positions",
+            "opd_rejected_offsets",
+            "opd_rejected_token_ids",
+            "opd_rejected_teacher_logprobs",
+            "opd_rejected_mask",
+        )
+        has_opd = [
+            all(key in item for key in (*opd_anchor_fields, *opd_rejected_fields))
+            for item in features
+        ]
+        if any(has_opd) and not all(has_opd):
+            raise ValueError("cannot mix DFlash OPD replay and ordinary samples in one batch")
+        if all(has_opd):
+            max_anchors = max(item["opd_anchor_positions"].shape[1] for item in features)
+            max_rejected = max(item["opd_rejected_anchor_positions"].shape[1] for item in features)
+            for key in opd_anchor_fields:
+                batch[key] = torch.cat(
+                    [self.paddingtensor2D(item[key], max_anchors) for item in features]
+                )
+            for key in opd_rejected_fields:
+                batch[key] = torch.cat(
+                    [self.paddingtensor2D(item[key], max_rejected) for item in features]
+                )
         return batch
 
 

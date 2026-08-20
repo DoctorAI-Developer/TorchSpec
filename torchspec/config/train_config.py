@@ -154,7 +154,7 @@ class TrainingConfig:
     dflash_block_size: int = 16
     dflash_dpace_alpha: float = 0.5
     dflash_loss_decay_gamma: float = 7.0
-    # "decay", "dpace", "auf", "lk", "path", or "tv"
+    # "decay", "dpace", "auf", "lk", "path", "tv", or "opd"
     dflash_loss_objective: str = "decay"
     dflash_ce_loss_alpha: float = 1.0
     dflash_l1_loss_alpha: float = 0.0
@@ -164,6 +164,8 @@ class TrainingConfig:
     # DFlash2-specific parameters (used by DFlash2 trainer only)
     dflash2_logits_chunk_size: int = 0
     dflash2_selector_loss_alpha: float = 1.0
+    dflash2_opd_rejected_stream_weight: float = 1.0
+    dflash2_opd_rejected_position_decay: float = 0.8
 
     # DSpark-specific parameters (used by DSpark trainer only)
     dspark_num_anchors: int = 512
@@ -333,6 +335,10 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
             "dflash2_logits_chunk_size must be >= 0 "
             f"(got {config.training.dflash2_logits_chunk_size}); 0 disables chunking"
         )
+    if config.training.dflash2_opd_rejected_stream_weight < 0:
+        raise ValueError("dflash2_opd_rejected_stream_weight must be non-negative")
+    if not 0 < config.training.dflash2_opd_rejected_position_decay <= 1:
+        raise ValueError("dflash2_opd_rejected_position_decay must be in (0, 1]")
 
 
 def _save_config_snapshot(config: DictConfig) -> None:
