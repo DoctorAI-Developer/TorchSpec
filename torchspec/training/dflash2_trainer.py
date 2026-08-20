@@ -37,6 +37,9 @@ class DFlash2Trainer(DFlashTrainer):
         self.selector_loss_alpha = getattr(args, "dflash2_selector_loss_alpha", 1.0)
         self.opd_rejected_stream_weight = getattr(args, "dflash2_opd_rejected_stream_weight", 1.0)
         self.opd_rejected_position_decay = getattr(args, "dflash2_opd_rejected_position_decay", 0.8)
+        self.opd_rejected_k3_preserve_negative_tail = getattr(
+            args, "dflash2_opd_rejected_k3_preserve_negative_tail", False
+        )
 
     def _build_draft_model(self, config):
         if config.block_size != self.block_size:
@@ -66,4 +69,7 @@ class DFlash2Trainer(DFlashTrainer):
             selector_loss_alpha=self.selector_loss_alpha,
             opd_rejected_stream_weight=self.opd_rejected_stream_weight,
             opd_rejected_position_decay=self.opd_rejected_position_decay,
+            opd_rejected_k3_preserve_negative_tail=(
+                self.opd_rejected_k3_preserve_negative_tail
+            ),
         )

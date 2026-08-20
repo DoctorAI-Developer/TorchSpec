@@ -166,6 +166,10 @@ class TrainingConfig:
     dflash2_selector_loss_alpha: float = 1.0
     dflash2_opd_rejected_stream_weight: float = 1.0
     dflash2_opd_rejected_position_decay: float = 0.8
+    # Preserve K3's exact, bounded-gradient negative tail while retaining the
+    # upstream clamps for positive importance-ratio outliers. Experimental;
+    # False exactly preserves the published Draft-OPD behavior.
+    dflash2_opd_rejected_k3_preserve_negative_tail: bool = False
 
     # DSpark-specific parameters (used by DSpark trainer only)
     dspark_num_anchors: int = 512

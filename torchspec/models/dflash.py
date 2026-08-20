@@ -257,6 +257,7 @@ class DFlashModel(nn.Module):
         l1_loss_alpha: float = 0.0,
         opd_rejected_stream_weight: float = 1.0,
         opd_rejected_position_decay: float = 0.8,
+        opd_rejected_k3_preserve_negative_tail: bool = False,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -278,6 +279,9 @@ class DFlashModel(nn.Module):
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.opd_rejected_stream_weight = float(opd_rejected_stream_weight)
         self.opd_rejected_position_decay = float(opd_rejected_position_decay)
+        self.opd_rejected_k3_preserve_negative_tail = bool(
+            opd_rejected_k3_preserve_negative_tail
+        )
         if self.opd_rejected_stream_weight < 0:
             raise ValueError("opd_rejected_stream_weight must be non-negative")
         if not 0 < self.opd_rejected_position_decay <= 1:
@@ -638,8 +642,25 @@ class DFlashModel(nn.Module):
         # Schulman's non-negative K3 estimator, matching Draft-OPD. These
         # rejected tokens were sampled by the draft distribution, so reverse
         # KL is the correct on-policy direction for this stream.
-        delta = (teacher_logprobs - student_logprobs).clamp(min=-20.0, max=20.0)
-        rejected_losses = (delta.exp() - delta - 1.0).clamp(min=-10.0, max=10.0)
+        raw_delta = teacher_logprobs - student_logprobs
+        clipped_delta = raw_delta.clamp(min=-20.0, max=20.0)
+        rejected_losses = (
+            clipped_delta.exp() - clipped_delta - 1.0
+        ).clamp(min=-10.0, max=10.0)
+        if self.opd_rejected_k3_preserve_negative_tail:
+            # K3 = exp(delta) - delta - 1. For delta <= 0 its value approaches
+            # -delta - 1 and d(loss)/d(student_logprob) is bounded in [0, 1].
+            # Restore that stable tail for top-k-rejected tokens while retaining
+            # the published clamps for the overflow-prone positive-ratio tail.
+            negative_delta = raw_delta.clamp(max=0.0)
+            negative_tail_losses = (
+                negative_delta.exp() - negative_delta - 1.0
+            )
+            rejected_losses = torch.where(
+                raw_delta < 0.0,
+                negative_tail_losses,
+                rejected_losses,
+            )
         offsets = rejected_offsets[rejected_mask].to(dtype=torch.float32)
         weights = torch.pow(
             offsets.new_tensor(self.opd_rejected_position_decay),

@@ -133,6 +133,7 @@ def _make_model(
     logits_chunk_size=0,
     loss_objective="decay",
     ce_loss_alpha=1.0,
+    opd_rejected_k3_preserve_negative_tail=False,
 ):
     config = _make_config()
     draft = DFlash2DraftModel(config).to(dtype=torch.float32)
@@ -146,6 +147,9 @@ def _make_model(
         ce_loss_alpha=ce_loss_alpha,
         logits_chunk_size=logits_chunk_size,
         selector_loss_alpha=selector_loss_alpha,
+        opd_rejected_k3_preserve_negative_tail=(
+            opd_rejected_k3_preserve_negative_tail
+        ),
     )
 
 
@@ -811,6 +815,42 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue(torch.allclose(components["opd_rejected_loss"][0], expected))
         numerator.backward()
         self.assertTrue(torch.isfinite(student_logprobs.grad).all())
+
+    def test_opd_rejected_k3_negative_tail_restores_bounded_gradient(self):
+        model = _make_model(
+            loss_objective="opd",
+            ce_loss_alpha=0,
+            opd_rejected_k3_preserve_negative_tail=True,
+        )
+        student_logprobs = torch.tensor([-2.0, -30.0], requires_grad=True)
+        draft_hidden = torch.randn(1, 8, 16, requires_grad=True)
+        lm_head = torch.randn(32, 16)
+
+        with mock.patch.object(
+            model,
+            "_selected_token_log_probs",
+            return_value=student_logprobs,
+        ):
+            numerator, denominator, _ = model._opd_rejected_loss(
+                draft_hidden=draft_hidden,
+                lm_head_weight=lm_head,
+                anchor_positions=torch.tensor([[2, 6]]),
+                block_keep_mask=torch.tensor([[True, True]]),
+                rejected_anchor_positions=torch.tensor([[2, 6]]),
+                rejected_offsets=torch.tensor([[1, 1]]),
+                rejected_token_ids=torch.tensor([[4, 9]]),
+                rejected_teacher_logprobs=torch.tensor([[-50.0, -1.0]]),
+                rejected_mask=torch.tensor([[True, True]]),
+            )
+
+        # The strongly negative tail keeps exact K3 value and unit-bounded
+        # gradient; the positive overflow tail retains the upstream flat cap.
+        self.assertTrue(torch.allclose(numerator, torch.tensor(57.0)))
+        self.assertTrue(torch.allclose(denominator, torch.tensor(2.0)))
+        numerator.backward()
+        self.assertTrue(
+            torch.allclose(student_logprobs.grad, torch.tensor([1.0, 0.0]))
+        )
 
     def test_opd_anchor_plan_uses_dynamic_observed_width(self):
         model = _make_model(loss_objective="opd", ce_loss_alpha=0)
