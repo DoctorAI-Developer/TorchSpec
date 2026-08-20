@@ -18,6 +18,7 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from torchspec.models.dflash import (
     DFlashModel,
+    _auf_position_mask,
     _create_dflash_mask_mod,
     _dpace_position_weights,
 )
@@ -597,6 +598,40 @@ class TestDFlashModelForward(unittest.TestCase):
 
         self.assertGreater(weights[0, 0, -1].item(), 0.0)
 
+    def test_auf_position_mask_keeps_prefix_and_first_failure(self):
+        predictions = torch.tensor(
+            [
+                [[0, 1, 9, 3, 8], [0, 1, 2, 3, 4]],
+                [[9, 1, 2, 3, 4], [0, 9, 2, 3, 4]],
+            ]
+        )
+        targets = torch.tensor([[[0, 1, 2, 3, 4]]] * 4).reshape_as(predictions)
+        valid = torch.tensor(
+            [
+                [[False, True, True, True, True], [False, True, True, True, True]],
+                [[False, True, False, True, True], [False, True, False, True, True]],
+            ]
+        )
+
+        mask = _auf_position_mask(predictions, targets, valid)
+
+        expected = torch.tensor(
+            [
+                [[False, True, True, False, False], [False, True, True, True, True]],
+                [[False, True, False, True, True], [False, True, False, False, False]],
+            ]
+        )
+        self.assertTrue(torch.equal(mask, expected))
+        self.assertFalse(mask.requires_grad)
+
+    def test_auf_position_mask_requires_matching_geometry(self):
+        with self.assertRaisesRegex(ValueError, "identical shapes"):
+            _auf_position_mask(
+                torch.zeros(1, 2, dtype=torch.long),
+                torch.zeros(1, 3, dtype=torch.long),
+                torch.ones(1, 2, dtype=torch.bool),
+            )
+
     def test_invalid_dflash_loss_objective_raises(self):
         with self.assertRaisesRegex(ValueError, "Unknown DFlash loss objective"):
             _make_dflash_model(loss_objective="not-a-loss")
@@ -635,6 +670,41 @@ class TestDFlashModelForward(unittest.TestCase):
         grad_found = any(
             p.requires_grad and p.grad is not None and p.grad.abs().sum() > 0
             for p in model.draft_model.parameters()
+        )
+        self.assertTrue(grad_found, "No gradient flowed to draft model parameters")
+
+    def test_auf_loss_requires_grad(self):
+        """AUF's detached hard support must still pass CE gradients."""
+        batch, seq_len = 1, 32
+        input_ids = torch.randint(0, self.V, (batch, seq_len))
+        hidden_states_list = [
+            torch.randn(batch, seq_len, self.H) for _ in range(self.num_target_layers)
+        ]
+        loss_mask = torch.ones(batch, seq_len)
+        lm_head_weight = torch.randn(self.V, self.H)
+        model = _make_dflash_model(
+            H=self.H,
+            V=self.V,
+            num_target_layers=self.num_target_layers,
+            block_size=4,
+            num_anchors=4,
+            loss_objective="auf",
+        )
+
+        model.train()
+        loss, *_ = model(
+            input_ids=input_ids,
+            hidden_states_list=hidden_states_list,
+            loss_mask=loss_mask,
+            lm_head_weight=lm_head_weight,
+        )
+        loss.backward()
+
+        grad_found = any(
+            parameter.requires_grad
+            and parameter.grad is not None
+            and parameter.grad.abs().sum() > 0
+            for parameter in model.draft_model.parameters()
         )
         self.assertTrue(grad_found, "No gradient flowed to draft model parameters")
 

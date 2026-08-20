@@ -35,7 +35,28 @@ import torch.nn.functional as F
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
 from torchspec.utils.logging import logger
 
-_VALID_DFLASH_LOSS_OBJECTIVES = {"decay", "dpace"}
+_VALID_DFLASH_LOSS_OBJECTIVES = {"auf", "decay", "dpace"}
+
+
+def _auf_position_mask(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Keep valid positions through each block's first detached greedy failure.
+
+    This is the Accept-Until-Fail support from Spec-AUF (arXiv:2607.01893):
+    the accepted prefix and its first failing ("breaker") token remain active,
+    while the suffix after that failure receives no loss. Fully correct blocks
+    retain every natively valid position.
+    """
+    if predictions.shape != targets.shape or predictions.shape != valid_mask.shape:
+        raise ValueError("AUF predictions, targets, and valid_mask must have identical shapes")
+    with torch.no_grad():
+        valid = valid_mask.bool()
+        mismatch = valid & predictions.detach().ne(targets)
+        prior_failures = mismatch.to(torch.int32).cumsum(dim=-1) - mismatch.to(torch.int32)
+        return valid & prior_failures.eq(0)
 
 
 def _dpace_position_weights(
@@ -519,6 +540,13 @@ class DFlashModel(nn.Module):
                     ).to(dtype=weight_mask.dtype)
                 dpace_weights[..., 1:] = dpace_pred_weights
             objective_weights = weight_mask * dpace_weights
+        elif self.loss_objective == "auf":
+            auf_mask = _auf_position_mask(
+                pred_ids.view(bsz, n_blocks, self.block_size),
+                target_ids,
+                weight_mask > 0,
+            )
+            objective_weights = weight_mask * auf_mask.to(dtype=weight_mask.dtype)
 
         flat_weights = objective_weights.view(-1)
         loss_numerator = (loss_per_token * flat_weights).sum()
