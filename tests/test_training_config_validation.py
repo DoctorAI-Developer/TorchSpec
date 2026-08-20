@@ -131,6 +131,19 @@ def test_load_config_rejects_negative_max_grad_norm():
         load_config(base_config=base)
 
 
+def test_load_config_rejects_negative_dflash2_logits_chunk_size():
+    base = _resolved_training_config(dflash2_logits_chunk_size=-1)
+    with pytest.raises(ValueError, match="dflash2_logits_chunk_size"):
+        load_config(base_config=base)
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 256])
+def test_load_config_accepts_non_negative_dflash2_logits_chunk_size(chunk_size):
+    base = _resolved_training_config(dflash2_logits_chunk_size=chunk_size)
+    config = load_config(base_config=base)
+    assert config.training.dflash2_logits_chunk_size == chunk_size
+
+
 def test_load_config_rejects_zero_inference_batch_size():
     """inference_batch_size=0 starves the inference pool (silent dispatch spin) and
     vLLM rejects max_num_seqs=0 late after init; reject at load."""

@@ -124,7 +124,7 @@ def _make_config(
     )
 
 
-def _make_model(selector_loss_alpha=0.4):
+def _make_model(selector_loss_alpha=0.4, logits_chunk_size=0):
     config = _make_config()
     draft = DFlash2DraftModel(config).to(dtype=torch.float32)
     draft.freeze_embedding()
@@ -133,6 +133,7 @@ def _make_model(selector_loss_alpha=0.4):
         block_size=config.block_size,
         num_anchors=2,
         loss_decay_gamma=4.0,
+        logits_chunk_size=logits_chunk_size,
         selector_loss_alpha=selector_loss_alpha,
     )
 
@@ -584,6 +585,40 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue(has_gradient(draft.candidate_selector.hidden_projection.parameters()))
         self.assertTrue(has_gradient(draft.context_proj.parameters()))
         self.assertIsNone(draft.embed_tokens.weight.grad)
+
+    def test_chunked_logits_match_full_loss_and_gradients(self):
+        full_model = _make_model(logits_chunk_size=0)
+        chunked_model = _make_model(logits_chunk_size=4)
+        chunked_model.load_state_dict(full_model.state_dict())
+        batch = _batch(seed=5)
+
+        torch.manual_seed(29)
+        full_result = full_model(**batch)
+        torch.manual_seed(29)
+        chunked_result = chunked_model(**batch)
+
+        for full_value, chunked_value in zip(full_result[:5], chunked_result[:5]):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        for key in full_result[5]:
+            for full_value, chunked_value in zip(full_result[5][key], chunked_result[5][key]):
+                self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        for full_value, chunked_value in zip(full_result[6], chunked_result[6]):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+
+        full_result[0].backward()
+        chunked_result[0].backward()
+        full_params = dict(full_model.named_parameters())
+        chunked_params = dict(chunked_model.named_parameters())
+        self.assertEqual(full_params.keys(), chunked_params.keys())
+        for name, full_param in full_params.items():
+            chunked_param = chunked_params[name]
+            if full_param.grad is None:
+                self.assertIsNone(chunked_param.grad, msg=name)
+            else:
+                self.assertTrue(
+                    torch.allclose(full_param.grad, chunked_param.grad, atol=1e-5, rtol=1e-5),
+                    msg=name,
+                )
 
     def test_all_masked_batch_has_zero_losses(self):
         loss, _, _, _, _, components, loss_terms = self.model(**_batch(all_masked=True))

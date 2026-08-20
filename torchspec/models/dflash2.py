@@ -24,12 +24,19 @@ import math
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from torchspec.models.dflash import DFlashModel
 
 
 class DFlash2Model(DFlashModel):
-    def __init__(self, *args, selector_loss_alpha: float = 1.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        selector_loss_alpha: float = 1.0,
+        logits_chunk_size: int = 0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         selector_loss_alpha = float(selector_loss_alpha)
         if not math.isfinite(selector_loss_alpha) or selector_loss_alpha <= 0:
@@ -37,6 +44,9 @@ class DFlash2Model(DFlashModel):
                 f"dflash2_selector_loss_alpha must be positive, got {selector_loss_alpha}"
             )
         self.selector_loss_alpha = selector_loss_alpha
+        self.logits_chunk_size = int(logits_chunk_size)
+        if self.logits_chunk_size < 0:
+            raise ValueError(f"logits_chunk_size must be non-negative, got {logits_chunk_size}")
 
         config = self.draft_model.config
         layer_types = list(getattr(config, "layer_types", []) or [])
@@ -83,6 +93,80 @@ class DFlash2Model(DFlashModel):
             logits = torch.tanh(logits / softcap) * softcap
         return logits
 
+    def _compute_token_statistics(
+        self,
+        draft_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_tokens = draft_hidden.shape[1]
+        if self.logits_chunk_size == 0 or total_tokens <= self.logits_chunk_size:
+            return super()._compute_token_statistics(
+                draft_hidden,
+                lm_head_weight,
+                target_ids,
+            )
+
+        batch, num_blocks, block_size = target_ids.shape
+        if block_size != self.block_size:
+            raise ValueError(
+                f"target block size {block_size} does not match model block size {self.block_size}"
+            )
+        blocks_per_chunk = max(1, self.logits_chunk_size // block_size)
+        hidden_blocks = draft_hidden.reshape(batch, num_blocks, block_size, -1)
+        ce_chunks = []
+        pred_chunks = []
+        selector_ce_chunks = []
+
+        def compute_chunk(hidden: torch.Tensor, targets: torch.Tensor):
+            chunk_blocks = targets.shape[1]
+            chunk_logits = self._compute_logits(
+                hidden.reshape(batch, chunk_blocks * block_size, -1),
+                lm_head_weight,
+            ).reshape(batch, chunk_blocks, block_size, -1)
+            flat_logits = chunk_logits.reshape(-1, chunk_logits.shape[-1])
+            flat_targets = targets.reshape(-1)
+            ce = F.cross_entropy(flat_logits, flat_targets, reduction="none").reshape_as(targets)
+            pred = torch.argmax(flat_logits, dim=-1).reshape_as(targets)
+
+            selector = self.draft_model.candidate_selector
+            scores, candidate_ids = selector.score_candidates(
+                hidden[..., 1:, :],
+                chunk_logits[..., 1:, :],
+                targets[..., :-1],
+                training_successor_ids=targets[..., 1:],
+            )
+            matches = candidate_ids == targets[..., 1:].unsqueeze(-1)
+            target_indices = matches.to(torch.int64).argmax(dim=-1)
+            selector_ce = F.cross_entropy(
+                scores.reshape(-1, scores.shape[-1]),
+                target_indices.reshape(-1),
+                reduction="none",
+            ).reshape_as(target_indices)
+            return ce, pred, selector_ce
+
+        for start in range(0, num_blocks, blocks_per_chunk):
+            stop = min(start + blocks_per_chunk, num_blocks)
+            hidden_chunk = hidden_blocks[:, start:stop]
+            target_chunk = target_ids[:, start:stop]
+            if self.training and hidden_chunk.requires_grad:
+                ce, pred, selector_ce = torch_checkpoint(
+                    compute_chunk,
+                    hidden_chunk,
+                    target_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                ce, pred, selector_ce = compute_chunk(hidden_chunk, target_chunk)
+            ce_chunks.append(ce)
+            pred_chunks.append(pred)
+            selector_ce_chunks.append(selector_ce)
+
+        ce_per_token = torch.cat(ce_chunks, dim=1).reshape(-1)
+        pred_ids = torch.cat(pred_chunks, dim=1).reshape(-1)
+        selector_ce = torch.cat(selector_ce_chunks, dim=1)
+        return ce_per_token, pred_ids, selector_ce
+
     def _extra_training_loss(
         self,
         draft_hidden: torch.Tensor,
@@ -90,27 +174,29 @@ class DFlash2Model(DFlashModel):
         target_ids: torch.Tensor,
         objective_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
-        batch, num_blocks, block_size = target_ids.shape
-        hidden = draft_hidden.reshape(batch, num_blocks, block_size, -1)[..., 1:, :]
-        unary_logits = logits.reshape(batch, num_blocks, block_size, -1)[..., 1:, :]
-        predecessor_ids = target_ids[..., :-1]
-        successor_ids = target_ids[..., 1:]
-
-        scores, candidate_ids = self.draft_model.candidate_selector.score_candidates(
-            hidden,
-            unary_logits,
-            predecessor_ids,
-            training_successor_ids=successor_ids,
-        )
-        matches = candidate_ids == successor_ids.unsqueeze(-1)
         eligible_weights = objective_weights[..., 1:]
         eligible_weights = eligible_weights * (eligible_weights > 0).cumprod(dim=-1)
-        target_indices = matches.to(torch.int64).argmax(dim=-1)
-        selector_ce = F.cross_entropy(
-            scores.reshape(-1, scores.shape[-1]),
-            target_indices.reshape(-1),
-            reduction="none",
-        ).reshape_as(eligible_weights)
+        if logits.shape != eligible_weights.shape:
+            batch, num_blocks, block_size = target_ids.shape
+            hidden = draft_hidden.reshape(batch, num_blocks, block_size, -1)[..., 1:, :]
+            unary_logits = logits.reshape(batch, num_blocks, block_size, -1)[..., 1:, :]
+            predecessor_ids = target_ids[..., :-1]
+            successor_ids = target_ids[..., 1:]
+            scores, candidate_ids = self.draft_model.candidate_selector.score_candidates(
+                hidden,
+                unary_logits,
+                predecessor_ids,
+                training_successor_ids=successor_ids,
+            )
+            matches = candidate_ids == successor_ids.unsqueeze(-1)
+            target_indices = matches.to(torch.int64).argmax(dim=-1)
+            selector_ce = F.cross_entropy(
+                scores.reshape(-1, scores.shape[-1]),
+                target_indices.reshape(-1),
+                reduction="none",
+            ).reshape_as(eligible_weights)
+        else:
+            selector_ce = logits
         selector_num = (selector_ce * eligible_weights).sum()
         selector_den = eligible_weights.sum().detach()
         return self.selector_loss_alpha * selector_num, {

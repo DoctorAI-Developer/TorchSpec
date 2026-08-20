@@ -161,6 +161,7 @@ class TrainingConfig:
     dflash_num_target_layers: int = 5
 
     # DFlash2-specific parameters (used by DFlash2 trainer only)
+    dflash2_logits_chunk_size: int = 0
     dflash2_selector_loss_alpha: float = 1.0
 
     # DSpark-specific parameters (used by DSpark trainer only)
@@ -325,6 +326,11 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         raise ValueError(
             f"max_grad_norm must be > 0 (got {config.training.max_grad_norm}); "
             f"0 zeroes all grads (silent flat loss), <0 sign-flips grads (silent gradient ascent)"
+        )
+    if config.training.dflash2_logits_chunk_size < 0:
+        raise ValueError(
+            "dflash2_logits_chunk_size must be >= 0 "
+            f"(got {config.training.dflash2_logits_chunk_size}); 0 disables chunking"
         )
 
 

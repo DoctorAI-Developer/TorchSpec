@@ -283,6 +283,26 @@ class DFlashModel(nn.Module):
             return self.draft_model.lm_head(draft_hidden)
         return F.linear(draft_hidden, lm_head_weight)
 
+    def _compute_token_statistics(
+        self,
+        draft_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-token CE, predicted IDs, and full logits.
+
+        Subclasses may return a compact third payload when their auxiliary
+        objective can be computed without retaining the full vocabulary
+        matrix. The base DFlash L1 path still requires full logits.
+        """
+        logits = self._compute_logits(draft_hidden, lm_head_weight)
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_targets = target_ids.reshape(-1)
+        ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        with torch.no_grad():
+            pred_ids = torch.argmax(flat_logits, dim=-1)
+        return ce_per_token, pred_ids, logits
+
     def _extra_training_loss(
         self,
         draft_hidden: torch.Tensor,
@@ -408,10 +428,7 @@ class DFlashModel(nn.Module):
             input_ids, hidden_states_list, loss_mask
         )
 
-        # 7. Compute logits via frozen LM head
-        logits = self._compute_logits(draft_hidden, lm_head_weight)
-
-        # 8. Compute labels and weight mask (SpecForge pattern)
+        # 7. Compute labels and weight mask (SpecForge pattern)
         # Labels: same-position prediction (position k predicts token at anchor+k)
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets  # [B, n_blocks, block_size]
@@ -423,6 +440,14 @@ class DFlashModel(nn.Module):
             2,
             safe_label_indices,
         )  # [B, n_blocks, block_size]
+
+        # 8. Project through the frozen LM head. DFlash2 can override this hook
+        # with an exact chunked path to bound the full-vocabulary peak.
+        ce_per_token, pred_ids, logits = self._compute_token_statistics(
+            draft_hidden,
+            lm_head_weight,
+            target_ids,
+        )
 
         # Weight mask: block validity × bounds × exclude anchor (pos 0) × loss_mask
         weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
@@ -446,13 +471,12 @@ class DFlashModel(nn.Module):
         binary_eval_mask = weight_mask.view(-1)
 
         # 9. Per-token loss: ce_loss_alpha*CE + l1_loss_alpha*L1.
-        vocab_size = logits.size(-1)
-        flat_logits = logits.view(-1, vocab_size)
         flat_targets = target_ids.view(-1)
-        ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
 
         loss_per_token = self.ce_loss_alpha * ce_per_token
         if self.uses_target_hidden_states:
+            if logits.shape != (*draft_hidden.shape[:-1], lm_head_weight.shape[0]):
+                raise RuntimeError("DFlash L1 distillation requires full draft logits")
             if last_hidden_states is None:
                 raise ValueError(
                     "DFlash L1 distillation (l1_loss_alpha > 0) requires target "
@@ -463,6 +487,8 @@ class DFlashModel(nn.Module):
             hdim = last_hidden_states.size(-1)
             gather_idx = tgt_idx.reshape(bsz, -1, 1).expand(-1, -1, hdim)
             aligned_hidden = torch.gather(last_hidden_states, 1, gather_idx)
+            vocab_size = lm_head_weight.shape[0]
+            flat_logits = logits.view(-1, vocab_size)
             target_logits = F.linear(aligned_hidden, lm_head_weight).view(-1, vocab_size)
             target_probs = torch.softmax(target_logits.float(), dim=-1)
             draft_probs = torch.softmax(flat_logits.float(), dim=-1)
@@ -508,7 +534,6 @@ class DFlashModel(nn.Module):
 
         # 10. Accuracy (using binary mask without decay)
         with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
             actual_token_count = binary_eval_mask.sum().clamp(min=1e-6)
             accuracy = correct.sum().float() / actual_token_count

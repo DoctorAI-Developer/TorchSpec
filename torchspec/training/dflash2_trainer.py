@@ -33,6 +33,7 @@ class DFlash2Trainer(DFlashTrainer):
 
     def __init__(self, args: Namespace):
         super().__init__(args)
+        self.logits_chunk_size = getattr(args, "dflash2_logits_chunk_size", 0)
         self.selector_loss_alpha = getattr(args, "dflash2_selector_loss_alpha", 1.0)
 
     def _build_draft_model(self, config):
@@ -59,5 +60,6 @@ class DFlash2Trainer(DFlashTrainer):
             loss_decay_gamma=self.loss_decay_gamma,
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,
+            logits_chunk_size=self.logits_chunk_size,
             selector_loss_alpha=self.selector_loss_alpha,
         )
