@@ -124,7 +124,12 @@ def _make_config(
     )
 
 
-def _make_model(selector_loss_alpha=0.4, logits_chunk_size=0):
+def _make_model(
+    selector_loss_alpha=0.4,
+    logits_chunk_size=0,
+    loss_objective="decay",
+    ce_loss_alpha=1.0,
+):
     config = _make_config()
     draft = DFlash2DraftModel(config).to(dtype=torch.float32)
     draft.freeze_embedding()
@@ -132,19 +137,21 @@ def _make_model(selector_loss_alpha=0.4, logits_chunk_size=0):
         draft_model=draft,
         block_size=config.block_size,
         num_anchors=2,
+        loss_objective=loss_objective,
         loss_decay_gamma=4.0,
+        ce_loss_alpha=ce_loss_alpha,
         logits_chunk_size=logits_chunk_size,
         selector_loss_alpha=selector_loss_alpha,
     )
 
 
-def _batch(seed=0, all_masked=False):
+def _batch(seed=0, all_masked=False, with_last_hidden_states=False):
     generator = torch.Generator().manual_seed(seed)
     batch_size, sequence_length, hidden_size, vocab_size = 2, 12, 16, 32
     loss_mask = torch.zeros(batch_size, sequence_length)
     if not all_masked:
         loss_mask[:, 2:] = 1
-    return {
+    batch = {
         "input_ids": torch.randint(
             0, vocab_size - 1, (batch_size, sequence_length), generator=generator
         ),
@@ -155,6 +162,14 @@ def _batch(seed=0, all_masked=False):
         "loss_mask": loss_mask,
         "lm_head_weight": torch.randn(vocab_size, hidden_size, generator=generator),
     }
+    if with_last_hidden_states:
+        batch["last_hidden_states"] = torch.randn(
+            batch_size,
+            sequence_length,
+            hidden_size,
+            generator=generator,
+        )
+    return batch
 
 
 class TestDFlash2Config(unittest.TestCase):
@@ -643,6 +658,45 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertEqual(full_params.keys(), chunked_params.keys())
         for name, full_param in full_params.items():
             chunked_param = chunked_params[name]
+            if full_param.grad is None:
+                self.assertIsNone(chunked_param.grad, msg=name)
+            else:
+                self.assertTrue(
+                    torch.allclose(full_param.grad, chunked_param.grad, atol=1e-5, rtol=1e-5),
+                    msg=name,
+                )
+
+    def test_chunked_lk_matches_full_loss_and_gradients(self):
+        full_model = _make_model(
+            logits_chunk_size=0,
+            loss_objective="lk",
+            ce_loss_alpha=0,
+        )
+        chunked_model = _make_model(
+            logits_chunk_size=4,
+            loss_objective="lk",
+            ce_loss_alpha=0,
+        )
+        chunked_model.load_state_dict(full_model.state_dict())
+        batch = _batch(seed=31, with_last_hidden_states=True)
+
+        torch.manual_seed(37)
+        full_result = full_model(**batch)
+        torch.manual_seed(37)
+        chunked_result = chunked_model(**batch)
+
+        for full_value, chunked_value in zip(full_result[:5], chunked_result[:5]):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        for key in full_result[5]:
+            for full_value, chunked_value in zip(full_result[5][key], chunked_result[5][key]):
+                self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        for full_value, chunked_value in zip(full_result[6], chunked_result[6]):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+
+        full_result[0].backward()
+        chunked_result[0].backward()
+        for name, full_param in full_model.named_parameters():
+            chunked_param = dict(chunked_model.named_parameters())[name]
             if full_param.grad is None:
                 self.assertIsNone(chunked_param.grad, msg=name)
             else:

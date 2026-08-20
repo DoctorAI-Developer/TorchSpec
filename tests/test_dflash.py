@@ -21,6 +21,7 @@ from torchspec.models.dflash import (
     _auf_position_mask,
     _create_dflash_mask_mod,
     _dpace_position_weights,
+    _likelihood_overlap_loss,
 )
 from torchspec.models.draft.dflash import (
     DFlashConfig,
@@ -65,6 +66,8 @@ def _make_dflash_model(
     num_anchors=4,
     loss_objective="decay",
     dpace_alpha=0.5,
+    ce_loss_alpha=1.0,
+    l1_loss_alpha=0.0,
 ):
     """Helper to create a DFlashModel for testing."""
     config = _make_config(
@@ -85,7 +88,40 @@ def _make_dflash_model(
         loss_objective=loss_objective,
         dpace_alpha=dpace_alpha,
         loss_decay_gamma=7.0,
+        ce_loss_alpha=ce_loss_alpha,
+        l1_loss_alpha=l1_loss_alpha,
     )
+
+
+class TestLikelihoodOverlapLoss(unittest.TestCase):
+    def test_identical_distributions_have_zero_loss(self):
+        logits = torch.tensor([[2.0, -1.0, 0.5], [-4.0, 1.0, 3.0]])
+
+        loss = _likelihood_overlap_loss(logits, logits)
+
+        self.assertTrue(torch.allclose(loss, torch.zeros_like(loss), atol=1e-7))
+
+    def test_binary_half_overlap_is_log_two(self):
+        draft_logits = torch.tensor([[0.0, 0.0]])
+        target_logits = torch.tensor([[80.0, -80.0]])
+
+        loss = _likelihood_overlap_loss(draft_logits, target_logits)
+
+        self.assertAlmostEqual(loss.item(), math.log(2.0), places=6)
+
+    def test_target_distribution_is_detached(self):
+        draft_logits = torch.tensor([[0.3, -0.2, 1.1]], requires_grad=True)
+        target_logits = torch.tensor([[1.0, 0.0, -0.5]], requires_grad=True)
+
+        _likelihood_overlap_loss(draft_logits, target_logits).sum().backward()
+
+        self.assertIsNotNone(draft_logits.grad)
+        self.assertGreater(draft_logits.grad.abs().sum(), 0)
+        self.assertIsNone(target_logits.grad)
+
+    def test_requires_matching_shapes(self):
+        with self.assertRaisesRegex(ValueError, "identical shapes"):
+            _likelihood_overlap_loss(torch.zeros(2, 3), torch.zeros(2, 4))
 
 
 class TestDFlashConfig(unittest.TestCase):
@@ -635,6 +671,36 @@ class TestDFlashModelForward(unittest.TestCase):
     def test_invalid_dflash_loss_objective_raises(self):
         with self.assertRaisesRegex(ValueError, "Unknown DFlash loss objective"):
             _make_dflash_model(loss_objective="not-a-loss")
+
+    def test_lk_requires_unblended_unary_objective(self):
+        with self.assertRaisesRegex(ValueError, "dflash_ce_loss_alpha=0"):
+            _make_dflash_model(loss_objective="lk")
+        with self.assertRaisesRegex(ValueError, "dflash_l1_loss_alpha=0"):
+            _make_dflash_model(
+                loss_objective="lk",
+                ce_loss_alpha=0,
+                l1_loss_alpha=0.5,
+            )
+
+    def test_lk_requires_target_hidden_states(self):
+        model = _make_dflash_model(
+            H=self.H,
+            V=self.V,
+            num_target_layers=self.num_target_layers,
+            block_size=4,
+            num_anchors=4,
+            loss_objective="lk",
+            ce_loss_alpha=0,
+        )
+        with self.assertRaisesRegex(ValueError, "last_hidden_states"):
+            model(
+                input_ids=torch.randint(0, self.V, (1, 32)),
+                hidden_states_list=[
+                    torch.randn(1, 32, self.H) for _ in range(self.num_target_layers)
+                ],
+                loss_mask=torch.ones(1, 32),
+                lm_head_weight=torch.randn(self.V, self.H),
+            )
 
     def test_invalid_dpace_alpha_raises(self):
         with self.assertRaisesRegex(ValueError, "dflash_dpace_alpha"):

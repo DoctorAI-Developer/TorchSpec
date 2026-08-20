@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from torchspec.models.dflash import DFlashModel
+from torchspec.models.dflash import DFlashModel, _likelihood_overlap_loss
 
 
 class DFlash2Model(DFlashModel):
@@ -98,13 +98,15 @@ class DFlash2Model(DFlashModel):
         draft_hidden: torch.Tensor,
         lm_head_weight: torch.Tensor,
         target_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        aligned_target_hidden: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         total_tokens = draft_hidden.shape[1]
         if self.logits_chunk_size == 0 or total_tokens <= self.logits_chunk_size:
             return super()._compute_token_statistics(
                 draft_hidden,
                 lm_head_weight,
                 target_ids,
+                aligned_target_hidden,
             )
 
         batch, num_blocks, block_size = target_ids.shape
@@ -114,11 +116,21 @@ class DFlash2Model(DFlashModel):
             )
         blocks_per_chunk = max(1, self.logits_chunk_size // block_size)
         hidden_blocks = draft_hidden.reshape(batch, num_blocks, block_size, -1)
+        target_hidden_blocks = (
+            None
+            if aligned_target_hidden is None
+            else aligned_target_hidden.reshape(batch, num_blocks, block_size, -1)
+        )
         ce_chunks = []
         pred_chunks = []
         selector_ce_chunks = []
+        likelihood_overlap_chunks = []
 
-        def compute_chunk(hidden: torch.Tensor, targets: torch.Tensor):
+        def compute_chunk(
+            hidden: torch.Tensor,
+            targets: torch.Tensor,
+            target_hidden: torch.Tensor | None,
+        ):
             chunk_blocks = targets.shape[1]
             chunk_logits = self._compute_logits(
                 hidden.reshape(batch, chunk_blocks * block_size, -1),
@@ -143,29 +155,53 @@ class DFlash2Model(DFlashModel):
                 target_indices.reshape(-1),
                 reduction="none",
             ).reshape_as(target_indices)
-            return ce, pred, selector_ce
+            likelihood_overlap_loss = ce.new_empty(0)
+            if self.loss_objective == "lk":
+                if target_hidden is None:
+                    raise ValueError("DFlash LK requires aligned target hidden states")
+                target_logits = F.linear(target_hidden, lm_head_weight)
+                likelihood_overlap_loss = _likelihood_overlap_loss(
+                    chunk_logits,
+                    target_logits,
+                )
+            return ce, pred, selector_ce, likelihood_overlap_loss
 
         for start in range(0, num_blocks, blocks_per_chunk):
             stop = min(start + blocks_per_chunk, num_blocks)
             hidden_chunk = hidden_blocks[:, start:stop]
             target_chunk = target_ids[:, start:stop]
+            target_hidden_chunk = (
+                None if target_hidden_blocks is None else target_hidden_blocks[:, start:stop]
+            )
             if self.training and hidden_chunk.requires_grad:
-                ce, pred, selector_ce = torch_checkpoint(
+                ce, pred, selector_ce, likelihood_overlap_loss = torch_checkpoint(
                     compute_chunk,
                     hidden_chunk,
                     target_chunk,
+                    target_hidden_chunk,
                     use_reentrant=False,
                 )
             else:
-                ce, pred, selector_ce = compute_chunk(hidden_chunk, target_chunk)
+                ce, pred, selector_ce, likelihood_overlap_loss = compute_chunk(
+                    hidden_chunk,
+                    target_chunk,
+                    target_hidden_chunk,
+                )
             ce_chunks.append(ce)
             pred_chunks.append(pred)
             selector_ce_chunks.append(selector_ce)
+            if self.loss_objective == "lk":
+                likelihood_overlap_chunks.append(likelihood_overlap_loss)
 
         ce_per_token = torch.cat(ce_chunks, dim=1).reshape(-1)
         pred_ids = torch.cat(pred_chunks, dim=1).reshape(-1)
         selector_ce = torch.cat(selector_ce_chunks, dim=1)
-        return ce_per_token, pred_ids, selector_ce
+        likelihood_overlap_loss = (
+            torch.cat(likelihood_overlap_chunks, dim=1).reshape(-1)
+            if likelihood_overlap_chunks
+            else None
+        )
+        return ce_per_token, pred_ids, selector_ce, likelihood_overlap_loss
 
     def _extra_training_loss(
         self,
