@@ -667,7 +667,7 @@ class TestDFlash2Forward(unittest.TestCase):
                 )
 
     def test_chunked_distribution_losses_match_full_loss_and_gradients(self):
-        for objective in ("lk", "tv"):
+        for objective in ("lk", "path", "tv"):
             with self.subTest(objective=objective):
                 full_model = _make_model(
                     logits_chunk_size=0,
@@ -688,9 +688,7 @@ class TestDFlash2Forward(unittest.TestCase):
                 chunked_result = chunked_model(**batch)
 
                 for full_value, chunked_value in zip(full_result[:5], chunked_result[:5]):
-                    self.assertTrue(
-                        torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
-                    )
+                    self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
                 for key in full_result[5]:
                     for full_value, chunked_value in zip(
                         full_result[5][key], chunked_result[5][key]
@@ -699,9 +697,7 @@ class TestDFlash2Forward(unittest.TestCase):
                             torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
                         )
                 for full_value, chunked_value in zip(full_result[6], chunked_result[6]):
-                    self.assertTrue(
-                        torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
-                    )
+                    self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
 
                 full_result[0].backward()
                 chunked_result[0].backward()

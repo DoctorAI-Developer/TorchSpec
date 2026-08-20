@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
 from torchspec.utils.logging import logger
 
-_VALID_DFLASH_LOSS_OBJECTIVES = {"auf", "decay", "dpace", "lk", "tv"}
+_VALID_DFLASH_LOSS_OBJECTIVES = {"auf", "decay", "dpace", "lk", "path", "tv"}
 
 
 def _distribution_overlap(
@@ -120,6 +120,24 @@ def _dpace_position_weights(
             dims=[-1],
         )
         return weights.to(dtype=confidences.dtype)
+
+
+def _path_overlap_position_weights(
+    likelihood_losses: torch.Tensor,
+    alpha: float,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Weight likelihood overlap by its smoothed expected-path contribution.
+
+    Kimi's likelihood-overlap loss supplies the exact one-step speculative
+    acceptance proxy ``a_j = sum_x min(p_j(x), q_j(x))``. D-PACE derives the
+    path value of position ``j`` as the suffix sum of prefix products. This
+    helper combines the two while retaining D-PACE's detached asymmetric
+    smoothing so weak suffix positions do not lose all training signal.
+    """
+    overlaps = torch.exp(-likelihood_losses.float())
+    weights = _dpace_position_weights(overlaps, alpha, valid_mask)
+    return weights.to(dtype=likelihood_losses.dtype)
 
 
 def _create_dflash_mask_mod(
@@ -212,7 +230,7 @@ class DFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
-        if self.loss_objective in {"lk", "tv"}:
+        if self.loss_objective in {"lk", "path", "tv"}:
             objective_name = self.loss_objective.upper()
             if self.ce_loss_alpha != 0:
                 raise ValueError(
@@ -228,7 +246,7 @@ class DFlashModel(nn.Module):
 
     @property
     def uses_target_hidden_states(self) -> bool:
-        return self.l1_loss_alpha > 0 or self.loss_objective in {"lk", "tv"}
+        return self.l1_loss_alpha > 0 or self.loss_objective in {"lk", "path", "tv"}
 
     def _sample_anchor_positions(
         self,
@@ -379,14 +397,14 @@ class DFlashModel(nn.Module):
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
         distribution_loss = None
-        if self.loss_objective in {"lk", "tv"}:
+        if self.loss_objective in {"lk", "path", "tv"}:
             if aligned_target_hidden is None:
-                raise ValueError("DFlash distribution training requires aligned target hidden states")
+                raise ValueError(
+                    "DFlash distribution training requires aligned target hidden states"
+                )
             target_logits = F.linear(aligned_target_hidden, lm_head_weight)
             objective = (
-                _likelihood_overlap_loss
-                if self.loss_objective == "lk"
-                else _total_variation_loss
+                _total_variation_loss if self.loss_objective == "tv" else _likelihood_overlap_loss
             )
             distribution_loss = objective(flat_logits, target_logits.reshape_as(flat_logits))
         return ce_per_token, pred_ids, logits, distribution_loss
@@ -535,7 +553,7 @@ class DFlashModel(nn.Module):
             if last_hidden_states is None:
                 requirement = (
                     f"DFlash {self.loss_objective.upper()}"
-                    if self.loss_objective in {"lk", "tv"}
+                    if self.loss_objective in {"lk", "path", "tv"}
                     else "DFlash L1 distillation (l1_loss_alpha > 0)"
                 )
                 raise ValueError(
@@ -579,10 +597,11 @@ class DFlashModel(nn.Module):
 
         # 9. Per-token unary objective. Distribution objectives replace CE/L1
         # rather than blending them. LK is Kimi K3's geometric objective; TV
-        # directly maximizes arithmetic one-step acceptance.
+        # directly maximizes arithmetic one-step acceptance; path adds
+        # D-PACE-style expected-prefix value to LK below.
         flat_targets = target_ids.view(-1)
 
-        if self.loss_objective in {"lk", "tv"}:
+        if self.loss_objective in {"lk", "path", "tv"}:
             if distribution_loss is None:
                 raise RuntimeError(
                     "DFlash distribution token statistics did not return overlap loss"
@@ -625,6 +644,16 @@ class DFlashModel(nn.Module):
                     ).to(dtype=weight_mask.dtype)
                 dpace_weights[..., 1:] = dpace_pred_weights
             objective_weights = weight_mask * dpace_weights
+        elif self.loss_objective == "path":
+            path_weights = torch.ones_like(weight_mask)
+            if self.block_size > 1:
+                path_pred_weights = _path_overlap_position_weights(
+                    distribution_loss.view(bsz, n_blocks, self.block_size)[..., 1:],
+                    self.dpace_alpha,
+                    valid_mask=weight_mask[..., 1:] > 0,
+                ).to(dtype=weight_mask.dtype)
+                path_weights[..., 1:] = path_pred_weights
+            objective_weights = weight_mask * path_weights
         elif self.loss_objective == "auf":
             auf_mask = _auf_position_mask(
                 pred_ids.view(bsz, n_blocks, self.block_size),

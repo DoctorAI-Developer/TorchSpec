@@ -160,16 +160,16 @@ class DFlash2Model(DFlashModel):
                 reduction="none",
             ).reshape_as(target_indices)
             distribution_loss = ce.new_empty(0)
-            if self.loss_objective in {"lk", "tv"}:
+            if self.loss_objective in {"lk", "path", "tv"}:
                 if target_hidden is None:
                     raise ValueError(
                         "DFlash distribution training requires aligned target hidden states"
                     )
                 target_logits = F.linear(target_hidden, lm_head_weight)
                 objective = (
-                    _likelihood_overlap_loss
-                    if self.loss_objective == "lk"
-                    else _total_variation_loss
+                    _total_variation_loss
+                    if self.loss_objective == "tv"
+                    else _likelihood_overlap_loss
                 )
                 distribution_loss = objective(chunk_logits, target_logits)
             return ce, pred, selector_ce, distribution_loss
@@ -198,7 +198,7 @@ class DFlash2Model(DFlashModel):
             ce_chunks.append(ce)
             pred_chunks.append(pred)
             selector_ce_chunks.append(selector_ce)
-            if self.loss_objective in {"lk", "tv"}:
+            if self.loss_objective in {"lk", "path", "tv"}:
                 distribution_loss_chunks.append(distribution_loss)
 
         ce_per_token = torch.cat(ce_chunks, dim=1).reshape(-1)

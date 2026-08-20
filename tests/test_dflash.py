@@ -22,6 +22,7 @@ from torchspec.models.dflash import (
     _create_dflash_mask_mod,
     _dpace_position_weights,
     _likelihood_overlap_loss,
+    _path_overlap_position_weights,
     _total_variation_loss,
 )
 from torchspec.models.draft.dflash import (
@@ -131,6 +132,26 @@ class TestLikelihoodOverlapLoss(unittest.TestCase):
     def test_requires_matching_shapes(self):
         with self.assertRaisesRegex(ValueError, "identical shapes"):
             _likelihood_overlap_loss(torch.zeros(2, 3), torch.zeros(2, 4))
+
+    def test_path_weights_match_smoothed_overlap_survival_value(self):
+        overlaps = torch.tensor([[0.8, 0.5, 0.25]])
+        losses = -torch.log(overlaps)
+
+        weights = _path_overlap_position_weights(losses, alpha=0.0)
+
+        # Prefix survival is [0.8, 0.4, 0.1]. Each position receives the
+        # detached sum of the prefix terms whose survival depends on it.
+        expected = torch.tensor([[1.3, 0.5, 0.1]])
+        self.assertTrue(torch.allclose(weights, expected, atol=1e-7))
+        self.assertFalse(weights.requires_grad)
+
+    def test_path_weights_stop_after_first_invalid_position(self):
+        losses = -torch.log(torch.tensor([[0.8, 0.5, 0.25, 0.9]]))
+        valid = torch.tensor([[True, True, False, True]])
+
+        weights = _path_overlap_position_weights(losses, alpha=0.0, valid_mask=valid)
+
+        self.assertTrue(torch.allclose(weights, torch.tensor([[1.2, 0.4, 0.0, 0.0]])))
 
 
 class TestDFlashConfig(unittest.TestCase):
@@ -695,6 +716,12 @@ class TestDFlashModelForward(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dflash_ce_loss_alpha=0"):
             _make_dflash_model(loss_objective="tv")
         model = _make_dflash_model(loss_objective="tv", ce_loss_alpha=0)
+        self.assertTrue(model.uses_target_hidden_states)
+
+    def test_path_requires_unblended_unary_objective(self):
+        with self.assertRaisesRegex(ValueError, "dflash_ce_loss_alpha=0"):
+            _make_dflash_model(loss_objective="path")
+        model = _make_dflash_model(loss_objective="path", ce_loss_alpha=0)
         self.assertTrue(model.uses_target_hidden_states)
 
     def test_lk_requires_target_hidden_states(self):

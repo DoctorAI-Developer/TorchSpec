@@ -154,7 +154,8 @@ class TrainingConfig:
     dflash_block_size: int = 16
     dflash_dpace_alpha: float = 0.5
     dflash_loss_decay_gamma: float = 7.0
-    dflash_loss_objective: str = "decay"  # "decay", "dpace", "auf", "lk", or "tv"
+    # "decay", "dpace", "auf", "lk", "path", or "tv"
+    dflash_loss_objective: str = "decay"
     dflash_ce_loss_alpha: float = 1.0
     dflash_l1_loss_alpha: float = 0.0
     dflash_num_anchors: int = 512
