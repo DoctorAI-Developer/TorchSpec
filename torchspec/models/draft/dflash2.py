@@ -174,7 +174,14 @@ class DFlash2Config(DFlashConfig):
             raise ValueError("DFlash2 training supports only default rope_parameters")
 
         num_hidden_layers = int(kwargs.get("num_hidden_layers", 5))
-        use_sliding_window = bool(kwargs.get("use_sliding_window", False))
+        configured_layer_types = list(kwargs.get("layer_types") or [])
+        has_sliding_layers = "sliding_attention" in configured_layer_types
+        if has_sliding_layers and kwargs.get("sliding_window") is None:
+            raise ValueError(
+                "DFlash2 sliding_attention layers require an explicit "
+                "sliding_window"
+            )
+        use_sliding_window = bool(kwargs.get("use_sliding_window", False)) or has_sliding_layers
         kwargs["sliding_window"] = (
             kwargs.get("sliding_window", 4096) if use_sliding_window else None
         )

@@ -296,6 +296,11 @@ class TestDFlash2Config(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conv_kernel_size"):
             DFlash2Config(**_tiny_config_kwargs(conv_kernel_size=3))
 
+        with self.assertRaisesRegex(ValueError, "sliding_window"):
+            DFlash2Config(
+                **_tiny_config_kwargs(layer_types=["sliding_attention"])
+            )
+
         for target_layer_ids in ([1, 12], [-1, 9], []):
             with self.subTest(target_layer_ids=target_layer_ids):
                 with self.assertRaisesRegex(ValueError, "target_layer_ids"):
@@ -631,7 +636,14 @@ class TestDFlash2Forward(unittest.TestCase):
 
 class TestDFlash2Export(unittest.TestCase):
     def test_config_exports_official_dflash2_schema(self):
-        config = _make_config()
+        config = DFlash2Config(
+            **{
+                **_make_config().to_dict(),
+                "use_sliding_window": True,
+                "sliding_window": 2048,
+                "layer_types": ["sliding_attention"],
+            }
+        )
         model = DFlash2DraftModel(config)
 
         exported = _fixup_export_config(config.to_dict())
@@ -643,6 +655,8 @@ class TestDFlash2Export(unittest.TestCase):
         self.assertEqual(exported["dflash_config"]["block_size"], 4)
         self.assertEqual(exported["dflash_config"]["conv_kernel_size"], 2)
         self.assertEqual(exported["dflash_config"]["selector_top_k"], 4)
+        self.assertEqual(exported["sliding_window"], 2048)
+        self.assertTrue(exported["use_sliding_window"])
         self.assertEqual(model.config_for_serving(), exported)
 
         trainer_class = _load_dflash2_trainer()
