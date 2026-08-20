@@ -258,6 +258,7 @@ class DFlashModel(nn.Module):
         opd_rejected_stream_weight: float = 1.0,
         opd_rejected_position_decay: float = 0.8,
         opd_rejected_k3_preserve_negative_tail: bool = False,
+        opd_accepted_objective: str = "forward_kl",
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -282,10 +283,15 @@ class DFlashModel(nn.Module):
         self.opd_rejected_k3_preserve_negative_tail = bool(
             opd_rejected_k3_preserve_negative_tail
         )
+        self.opd_accepted_objective = str(opd_accepted_objective).lower()
         if self.opd_rejected_stream_weight < 0:
             raise ValueError("opd_rejected_stream_weight must be non-negative")
         if not 0 < self.opd_rejected_position_decay <= 1:
             raise ValueError("opd_rejected_position_decay must be in (0, 1]")
+        if self.opd_accepted_objective not in {"forward_kl", "tv", "lk"}:
+            raise ValueError(
+                "opd_accepted_objective must be one of forward_kl, tv, or lk"
+            )
         if self.loss_objective in {"lk", "opd", "path", "tv"}:
             objective_name = self.loss_objective.upper()
             if self.ce_loss_alpha != 0:
@@ -515,15 +521,37 @@ class DFlashModel(nn.Module):
                 )
             target_logits = F.linear(aligned_target_hidden, lm_head_weight)
             target_logits = target_logits.reshape_as(flat_logits)
-            if self.loss_objective == "tv":
-                distribution_loss = _total_variation_loss(flat_logits, target_logits)
-            elif self.loss_objective == "opd":
-                distribution_loss = _bernoulli_forward_kl_loss(
-                    flat_logits, target_logits, flat_targets
-                )
-            else:
-                distribution_loss = _likelihood_overlap_loss(flat_logits, target_logits)
+            distribution_loss = self._distribution_token_loss(
+                flat_logits,
+                target_logits,
+                flat_targets,
+            )
         return ce_per_token, pred_ids, logits, distribution_loss
+
+    def _distribution_token_loss(
+        self,
+        draft_logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select the configured full-distribution unary loss.
+
+        OPD controls the correction-state distribution independently from the
+        accepted-token objective. Its default remains local Bernoulli forward
+        KL; TV and likelihood-overlap are explicit experimental alternatives.
+        """
+
+        if self.loss_objective == "tv" or (
+            self.loss_objective == "opd" and self.opd_accepted_objective == "tv"
+        ):
+            return _total_variation_loss(draft_logits, target_logits)
+        if self.loss_objective == "opd" and self.opd_accepted_objective == "forward_kl":
+            return _bernoulli_forward_kl_loss(
+                draft_logits,
+                target_logits,
+                target_ids,
+            )
+        return _likelihood_overlap_loss(draft_logits, target_logits)
 
     def _selected_token_log_probs(
         self,

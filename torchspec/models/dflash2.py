@@ -26,12 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from torchspec.models.dflash import (
-    DFlashModel,
-    _bernoulli_forward_kl_loss,
-    _likelihood_overlap_loss,
-    _total_variation_loss,
-)
+from torchspec.models.dflash import DFlashModel
 
 
 class DFlash2Model(DFlashModel):
@@ -167,14 +162,11 @@ class DFlash2Model(DFlashModel):
                         "DFlash distribution training requires aligned target hidden states"
                     )
                 target_logits = F.linear(target_hidden, lm_head_weight)
-                if self.loss_objective == "tv":
-                    distribution_loss = _total_variation_loss(chunk_logits, target_logits)
-                elif self.loss_objective == "opd":
-                    distribution_loss = _bernoulli_forward_kl_loss(
-                        chunk_logits, target_logits, targets
-                    )
-                else:
-                    distribution_loss = _likelihood_overlap_loss(chunk_logits, target_logits)
+                distribution_loss = self._distribution_token_loss(
+                    chunk_logits,
+                    target_logits,
+                    targets,
+                )
             return ce, pred, selector_ce, distribution_loss
 
         for start in range(0, num_blocks, blocks_per_chunk):

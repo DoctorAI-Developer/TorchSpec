@@ -40,6 +40,9 @@ class DFlash2Trainer(DFlashTrainer):
         self.opd_rejected_k3_preserve_negative_tail = getattr(
             args, "dflash2_opd_rejected_k3_preserve_negative_tail", False
         )
+        self.opd_accepted_objective = getattr(
+            args, "dflash2_opd_accepted_objective", "forward_kl"
+        )
 
     def _build_draft_model(self, config):
         if config.block_size != self.block_size:
@@ -72,4 +75,5 @@ class DFlash2Trainer(DFlashTrainer):
             opd_rejected_k3_preserve_negative_tail=(
                 self.opd_rejected_k3_preserve_negative_tail
             ),
+            opd_accepted_objective=self.opd_accepted_objective,
         )

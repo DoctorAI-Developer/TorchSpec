@@ -67,6 +67,14 @@ def test_validate_training_batch_config_accepts_positive():
     _validate_training_batch_config(config)  # must not raise
 
 
+def test_load_config_rejects_invalid_opd_accepted_objective():
+    base = _resolved_training_config(
+        dflash2_opd_accepted_objective="unsupported"
+    )
+    with pytest.raises(ValueError, match="dflash2_opd_accepted_objective"):
+        load_config(base_config=base)
+
+
 # --- Numeric training-config fields (draft_accumulation_steps, learning_rate,
 #     max_grad_norm) and inference_batch_size — PR #171 idiom extended. ---
 

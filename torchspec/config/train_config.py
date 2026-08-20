@@ -170,6 +170,10 @@ class TrainingConfig:
     # upstream clamps for positive importance-ratio outliers. Experimental;
     # False exactly preserves the published Draft-OPD behavior.
     dflash2_opd_rejected_k3_preserve_negative_tail: bool = False
+    # Accepted-token distribution loss inside exact OPD correction segments.
+    # forward_kl preserves the published translation; tv directly maximizes
+    # one-step sampling overlap; lk uses the likelihood-overlap surrogate.
+    dflash2_opd_accepted_objective: str = "forward_kl"
 
     # DSpark-specific parameters (used by DSpark trainer only)
     dspark_num_anchors: int = 512
@@ -343,6 +347,14 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         raise ValueError("dflash2_opd_rejected_stream_weight must be non-negative")
     if not 0 < config.training.dflash2_opd_rejected_position_decay <= 1:
         raise ValueError("dflash2_opd_rejected_position_decay must be in (0, 1]")
+    if config.training.dflash2_opd_accepted_objective not in {
+        "forward_kl",
+        "tv",
+        "lk",
+    }:
+        raise ValueError(
+            "dflash2_opd_accepted_objective must be one of forward_kl, tv, or lk"
+        )
 
 
 def _save_config_snapshot(config: DictConfig) -> None:

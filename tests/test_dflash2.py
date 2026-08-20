@@ -41,6 +41,7 @@ from torchspec.models.dflash import (
     _bernoulli_forward_kl_loss,
     _create_dflash_mask_mod,
     _dpace_position_weights,
+    _total_variation_loss,
 )
 from torchspec.models.dflash2 import DFlash2Model
 from torchspec.models.draft.auto import AutoDraftModelConfig
@@ -134,6 +135,7 @@ def _make_model(
     loss_objective="decay",
     ce_loss_alpha=1.0,
     opd_rejected_k3_preserve_negative_tail=False,
+    opd_accepted_objective="forward_kl",
 ):
     config = _make_config()
     draft = DFlash2DraftModel(config).to(dtype=torch.float32)
@@ -150,6 +152,7 @@ def _make_model(
         opd_rejected_k3_preserve_negative_tail=(
             opd_rejected_k3_preserve_negative_tail
         ),
+        opd_accepted_objective=opd_accepted_objective,
     )
 
 
@@ -783,6 +786,59 @@ class TestDFlash2Forward(unittest.TestCase):
                     msg=name,
                 )
 
+    def test_opd_tv_token_statistics_match_chunked_loss_and_gradients(self):
+        full_model = _make_model(
+            logits_chunk_size=0,
+            loss_objective="opd",
+            ce_loss_alpha=0,
+            opd_accepted_objective="tv",
+        )
+        chunked_model = _make_model(
+            logits_chunk_size=4,
+            loss_objective="opd",
+            ce_loss_alpha=0,
+            opd_accepted_objective="tv",
+        )
+        chunked_model.load_state_dict(full_model.state_dict())
+        generator = torch.Generator().manual_seed(109)
+        full_hidden = torch.randn(2, 8, 16, generator=generator, requires_grad=True)
+        chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
+        target_hidden = torch.randn(2, 8, 16, generator=generator)
+        target_ids = torch.randint(0, 32, (2, 2, 4), generator=generator)
+        full_head = torch.randn(32, 16, generator=generator, requires_grad=True)
+        chunked_head = full_head.detach().clone().requires_grad_(True)
+
+        full_result = full_model._compute_token_statistics(
+            full_hidden,
+            full_head,
+            target_ids,
+            target_hidden,
+        )
+        chunked_result = chunked_model._compute_token_statistics(
+            chunked_hidden,
+            chunked_head,
+            target_ids,
+            target_hidden,
+        )
+
+        for index in (0, 1, 3):
+            self.assertTrue(
+                torch.allclose(
+                    full_result[index],
+                    chunked_result[index],
+                    atol=1e-6,
+                    rtol=1e-6,
+                )
+            )
+        (full_result[0].sum() + full_result[3].sum()).backward()
+        (chunked_result[0].sum() + chunked_result[3].sum()).backward()
+        self.assertTrue(
+            torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5)
+        )
+        self.assertTrue(
+            torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5)
+        )
+
     def test_opd_rejected_stream_uses_k3_and_position_decay(self):
         model = _make_model(loss_objective="opd", ce_loss_alpha=0)
         student_logprobs = torch.tensor([-1.7, -3.2], requires_grad=True)
@@ -884,6 +940,31 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue(torch.allclose(actual, expected.unsqueeze(0), atol=1e-6))
         actual.sum().backward()
         self.assertTrue(torch.isfinite(draft_logits.grad).all())
+
+    def test_opd_tv_accepted_objective_matches_total_variation(self):
+        model = _make_model(
+            loss_objective="opd",
+            ce_loss_alpha=0,
+            opd_accepted_objective="tv",
+        )
+        draft_logits = torch.tensor([[0.1, 1.2, -0.4]], requires_grad=True)
+        target_logits = torch.tensor([[0.7, -0.3, 0.2]])
+        target_ids = torch.tensor([2])
+
+        actual = model._distribution_token_loss(
+            draft_logits,
+            target_logits,
+            target_ids,
+        )
+        expected = _total_variation_loss(draft_logits, target_logits)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        actual.sum().backward()
+        self.assertTrue(torch.isfinite(draft_logits.grad).all())
+
+    def test_invalid_opd_accepted_objective_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "opd_accepted_objective"):
+            _make_model(opd_accepted_objective="unsupported")
 
     def test_all_masked_batch_has_zero_losses(self):
         loss, _, _, _, _, components, loss_terms = self.model(**_batch(all_masked=True))
