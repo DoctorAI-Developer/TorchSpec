@@ -334,6 +334,79 @@ class TestTokenizeWorkerAutoMetadata:
         assert "has_thinking" not in self._run(_THINKING_CONV, True)
 
 
+class TestGeneralParserWorkerMetadata:
+    def test_tokenize_worker_forwards_tools_and_generation_config(self):
+        from torchspec.data import dataset as dataset_mod
+
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        generation_config = {"temperature": 1.0, "top_p": 0.95}
+        captured = {}
+
+        def fake_preprocess(*_args, **kwargs):
+            captured.update(kwargs)
+            return {
+                "input_ids": [torch.tensor([[1, 2, 3]], dtype=torch.long)],
+                "packed_loss_mask": ["1,2"],
+                "formatted_text": ["rendered"],
+            }
+
+        saved = dict(dataset_mod._worker_state)
+        dataset_mod._worker_state.clear()
+        dataset_mod._worker_state.update(
+            {
+                "renderer": None,
+                "preprocess": fake_preprocess,
+                "tokenizer": object(),
+                "template": object(),
+                "last_turn_loss_only": False,
+                "min_loss_tokens": 1,
+            }
+        )
+        try:
+            result = dataset_mod._tokenize_single(
+                (_PLAIN_CONV, tools, generation_config, 128, False)
+            )
+        finally:
+            dataset_mod._worker_state.clear()
+            dataset_mod._worker_state.update(saved)
+
+        assert result is not None
+        assert captured["tools"] == [tools]
+        assert captured["generation_config"] == [generation_config]
+
+    def test_format_worker_forwards_tools_and_generation_config(self):
+        from torchspec.data import dataset as dataset_mod
+
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        generation_config = {"temperature": 1.0}
+
+        class CapturingParser:
+            def __init__(self):
+                self.kwargs = None
+
+            def format(self, _messages, **kwargs):
+                self.kwargs = kwargs
+                return "rendered"
+
+        parser = CapturingParser()
+        saved = dict(dataset_mod._worker_state)
+        dataset_mod._worker_state.clear()
+        dataset_mod._worker_state.update(
+            {"parser": parser, "last_turn_loss_only": False}
+        )
+        try:
+            result = dataset_mod._format_single(
+                (_PLAIN_CONV, tools, generation_config, 128, False)
+            )
+        finally:
+            dataset_mod._worker_state.clear()
+            dataset_mod._worker_state.update(saved)
+
+        assert result == {"formatted_prompt": "rendered"}
+        assert parser.kwargs["tools"] is tools
+        assert parser.kwargs["generation_config"] is generation_config
+
+
 class TestDropStaleMultimodalMasks:
     def _prompt(self, metadata=None):
         return {

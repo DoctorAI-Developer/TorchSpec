@@ -260,6 +260,8 @@ def _tokenize_single(args):
         return_formatted_text=True,
         last_turn_loss_only=last_turn_only,
         min_loss_tokens=_worker_state.get("min_loss_tokens", 0),
+        tools=[tools],
+        generation_config=[generation_config],
     )
     if not processed["input_ids"]:
         return None
@@ -287,14 +289,18 @@ def _format_single(args):
     """
     Worker function — format only, skip tokenization.
     """
-    messages, _, _, _, train_with_decode = args
+    messages, tools, generation_config, _, train_with_decode = args
     messages = _normalize_conversation(messages)
 
     result = _auto_decision_metadata(_resolve_last_turn_loss_only(messages))
 
     parser = _worker_state["parser"]
     formatted = parser.format(
-        messages, add_generation_prompt=train_with_decode, expand_media_tokens=False
+        messages,
+        add_generation_prompt=train_with_decode,
+        expand_media_tokens=False,
+        tools=tools,
+        generation_config=generation_config,
     )
     if not formatted:
         return None
