@@ -338,6 +338,7 @@ def test_generate_eval_cache_times_out_when_eval_never_arrives():
         mock.patch("torchspec.controller.eval.ray.get", side_effect=lambda x: x),
         mock.patch("torchspec.controller.eval.time.sleep") as mock_sleep,
         mock.patch("torchspec.controller.eval.EVAL_CACHE_IDLE_TIMEOUT", 0.0),
+        mock.patch.dict("os.environ", {}, clear=True),
     ):
         with pytest.raises(TimeoutError, match="Timed out while waiting for eval cache generation"):
             eval_utils.generate_eval_cache(controller, train_group, state)
@@ -345,6 +346,31 @@ def test_generate_eval_cache_times_out_when_eval_never_arrives():
     train_group.cache_eval_samples.assert_not_called()
     controller.finalize_eval_dispatch.remote.assert_not_called()
     mock_sleep.assert_not_called()
+
+
+def test_eval_cache_idle_timeout_preserves_default():
+    with mock.patch.dict("os.environ", {}, clear=True):
+        assert eval_utils._eval_cache_idle_timeout() == 300.0
+
+
+def test_eval_cache_idle_timeout_accepts_positive_environment_override():
+    with mock.patch.dict(
+        "os.environ",
+        {eval_utils.EVAL_CACHE_IDLE_TIMEOUT_ENV: "1800"},
+        clear=True,
+    ):
+        assert eval_utils._eval_cache_idle_timeout() == 1800.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_eval_cache_idle_timeout_rejects_invalid_environment_override(value):
+    with mock.patch.dict(
+        "os.environ",
+        {eval_utils.EVAL_CACHE_IDLE_TIMEOUT_ENV: value},
+        clear=True,
+    ):
+        with pytest.raises(ValueError, match="must be a finite positive number"):
+            eval_utils._eval_cache_idle_timeout()
 
 
 def test_setup_eval_dispatch_bs_is_dp_size():

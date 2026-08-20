@@ -22,6 +22,7 @@
 
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -35,6 +36,28 @@ from torchspec.training.checkpoint import _read_checkpoint_metadata, _write_chec
 from torchspec.utils.logging import logger
 
 EVAL_CACHE_IDLE_TIMEOUT = 300.0
+EVAL_CACHE_IDLE_TIMEOUT_ENV = "TORCHSPEC_EVAL_CACHE_IDLE_TIMEOUT_SECONDS"
+
+
+def _eval_cache_idle_timeout() -> float:
+    """Return the eval-cache stall timeout, preserving the 300 s default."""
+    raw_timeout = os.environ.get(EVAL_CACHE_IDLE_TIMEOUT_ENV)
+    if raw_timeout is None:
+        return EVAL_CACHE_IDLE_TIMEOUT
+
+    try:
+        idle_timeout = float(raw_timeout)
+    except ValueError as exc:
+        raise ValueError(
+            f"{EVAL_CACHE_IDLE_TIMEOUT_ENV} must be a finite positive number, "
+            f"got {raw_timeout!r}"
+        ) from exc
+    if not math.isfinite(idle_timeout) or idle_timeout <= 0:
+        raise ValueError(
+            f"{EVAL_CACHE_IDLE_TIMEOUT_ENV} must be a finite positive number, "
+            f"got {raw_timeout!r}"
+        )
+    return idle_timeout
 
 
 @dataclass
@@ -53,12 +76,13 @@ class EvalSetupState:
 def _check_idle_timeout(
     dispatched_samples: int, last_progress_at: float, total_samples: int
 ) -> None:
+    idle_timeout = _eval_cache_idle_timeout()
     idle_for = time.monotonic() - last_progress_at
-    if idle_for >= EVAL_CACHE_IDLE_TIMEOUT:
+    if idle_for >= idle_timeout:
         raise TimeoutError(
             "Timed out while waiting for eval cache generation "
             f"(no progress during eval for {idle_for:.1f}s, "
-            f"idle_timeout={EVAL_CACHE_IDLE_TIMEOUT:.1f}s, "
+            f"idle_timeout={idle_timeout:.1f}s, "
             f"dispatched={dispatched_samples}/{total_samples} samples)"
         )
 
