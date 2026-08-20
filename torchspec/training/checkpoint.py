@@ -145,9 +145,25 @@ def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
     with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
         tensors = {key: f.get_tensor(key) for key in f.keys()}
 
-    draft_model.load_state_dict(
-        to_internal_keys(tensors, draft_model.state_dict().keys()), strict=True
+    model_keys = draft_model.state_dict().keys()
+    # Published DFlash drafts share the target's embedding and therefore omit
+    # embed_tokens.weight; the trainer fills it with load_embedding() directly
+    # after this call.  Keep every other missing or unexpected key strict so a
+    # truncated or incompatible checkpoint cannot silently start training.
+    tensors = to_internal_keys(tensors, model_keys)
+    incompatible = draft_model.load_state_dict(tensors, strict=False)
+    allowed_missing = (
+        {"embed_tokens.weight"}
+        if draft_model.__class__.__name__ == "DFlashDraftModel"
+        else set()
     )
+    missing = set(incompatible.missing_keys) - allowed_missing
+    unexpected = set(incompatible.unexpected_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Published draft checkpoint is incompatible: "
+            f"missing_keys={sorted(missing)}, unexpected_keys={sorted(unexpected)}"
+        )
     return checkpoint_path
 
 

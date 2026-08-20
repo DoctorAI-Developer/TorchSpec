@@ -157,6 +157,25 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
 
         self._assert_matches(fresh, published)
 
+    def test_loads_a_published_dflash_draft_without_shared_embedding(self):
+        published = _build(_DFLASH, seed=0)
+        tensors = to_export_keys(published.state_dict())
+        tensors.pop("embed_tokens.weight")
+        directory = self.tmpdir / "dflash-no-embedding"
+        directory.mkdir()
+        save_file(tensors, str(directory / "model.safetensors"))
+
+        fresh = _build(_DFLASH, seed=1)
+        original_embedding = fresh.embed_tokens.weight.detach().clone()
+        load_initial_draft_weights(fresh, str(directory))
+
+        expected = published.state_dict()
+        for key, value in fresh.state_dict().items():
+            if key == "embed_tokens.weight":
+                self.assertTrue(torch.equal(value, original_embedding))
+            else:
+                self.assertTrue(torch.equal(value, expected[key]), msg=f"{key} was not restored")
+
     def test_loads_a_checkpoint_that_already_uses_internal_keys(self):
         published = _build(_EAGLE3, seed=0)
         directory = self.tmpdir / "native"
