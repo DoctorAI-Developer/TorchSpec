@@ -134,6 +134,12 @@ class DFlashTrainer(Trainer):
             draft_model = self._build_draft_model(config)
 
         if dist.get_rank() == 0:
+            initial_draft_model_path = getattr(self.args, "initial_draft_model_path", None)
+            if initial_draft_model_path:
+                loaded_from = checkpoint.load_initial_draft_weights(
+                    draft_model, initial_draft_model_path
+                )
+                logger.info(f"[Rank 0] Loaded initial draft weights from {loaded_from}")
             draft_model.load_embedding(
                 target_model_path,
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens.weight"),
@@ -141,6 +147,11 @@ class DFlashTrainer(Trainer):
 
         draft_model.freeze_embedding()
         draft_model = draft_model.to(torch.bfloat16)
+        # Enable gradient checkpointing from config (cuts backward activation
+        # memory ~60-80%, which is required for colocated training on one GPU).
+        draft_model.gradient_checkpointing = getattr(
+            self.args, "gradient_checkpointing", False
+        )
 
         dist.barrier(group=get_gloo_group())
 

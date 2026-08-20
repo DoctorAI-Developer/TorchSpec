@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from transformers import PretrainedConfig, PreTrainedModel
 
 from torchspec.config.utils import resolve_rope_theta
@@ -458,13 +459,24 @@ class DFlashDraftModel(PreTrainedModel):
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
         for layer in self.layers:
-            draft_hidden = layer(
-                draft_hidden=draft_hidden,
-                context_hidden=context_feature,
-                draft_position_ids=draft_position_ids,
-                context_position_ids=context_position_ids,
-                block_mask=block_mask,
-            )
+            if getattr(self, "gradient_checkpointing", False) and self.training:
+                draft_hidden = torch_checkpoint(
+                    layer,
+                    draft_hidden,
+                    context_feature,
+                    draft_position_ids,
+                    context_position_ids,
+                    block_mask,
+                    use_reentrant=False,
+                )
+            else:
+                draft_hidden = layer(
+                    draft_hidden=draft_hidden,
+                    context_hidden=context_feature,
+                    draft_position_ids=draft_position_ids,
+                    context_position_ids=context_position_ids,
+                    block_mask=block_mask,
+                )
 
         return self.final_norm(draft_hidden)
 

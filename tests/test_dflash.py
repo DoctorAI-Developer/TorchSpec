@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from torchspec.models.dflash import (
     DFlashModel,
@@ -485,6 +486,44 @@ class TestDFlashModelForward(unittest.TestCase):
                     grad_found = True
                     break
         self.assertTrue(grad_found, "No gradient flowed to draft model parameters")
+
+    def test_gradient_checkpointing_runs_only_while_training(self):
+        B, seq_len = 1, 32
+        input_ids = torch.randint(0, self.V, (B, seq_len))
+        hidden_states_list = [
+            torch.randn(B, seq_len, self.H) for _ in range(self.num_target_layers)
+        ]
+        loss_mask = torch.ones(B, seq_len)
+        lm_head_weight = torch.randn(self.V, self.H)
+        self.model.draft_model.gradient_checkpointing = True
+
+        self.model.train()
+        with mock.patch(
+            "torchspec.models.draft.dflash.torch_checkpoint",
+            wraps=torch_checkpoint,
+        ) as checkpoint_call:
+            loss, *_ = self.model(
+                input_ids=input_ids,
+                hidden_states_list=hidden_states_list,
+                loss_mask=loss_mask,
+                lm_head_weight=lm_head_weight,
+            )
+            loss.backward()
+        self.assertEqual(checkpoint_call.call_count, len(self.model.draft_model.layers))
+
+        self.model.eval()
+        with mock.patch(
+            "torchspec.models.draft.dflash.torch_checkpoint",
+            wraps=torch_checkpoint,
+        ) as checkpoint_call:
+            with torch.no_grad():
+                self.model(
+                    input_ids=input_ids,
+                    hidden_states_list=hidden_states_list,
+                    loss_mask=loss_mask,
+                    lm_head_weight=lm_head_weight,
+                )
+        checkpoint_call.assert_not_called()
 
     def test_loss_mask_at_label_positions(self):
         """Loss mask should be gathered at label positions (SpecForge pattern).
