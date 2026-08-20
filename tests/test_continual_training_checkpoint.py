@@ -59,3 +59,31 @@ def test_restore_fp32_master_params_keeps_fresh_optimizer_hparams():
     assert group["weight_decay"] == 0.456
     assert optimizer.optimizer.state == {}
     assert torch.equal(optimizer.fp32_params[0].detach(), torch.tensor([42.0], dtype=torch.float32))
+
+
+def test_finalize_load_releases_checkpoint_restore_cuda_cache():
+    actor = SimpleNamespace(
+        args=SimpleNamespace(continual_training=False, start_step=None),
+        global_step=0,
+    )
+    payload = {
+        "metadata": {"global_step": 5, "next_step": 6},
+        "iteration": 6,
+        "optimizer_dir": Path("/tmp/fake_optim"),
+        "rng": None,
+    }
+
+    with (
+        mock.patch("torchspec.training.checkpoint.dist.barrier") as barrier,
+        mock.patch("torchspec.training.checkpoint.torch.cuda.synchronize") as synchronize,
+        mock.patch("torchspec.training.checkpoint.gc.collect") as collect,
+        mock.patch("torchspec.training.checkpoint.torch.cuda.empty_cache") as empty_cache,
+    ):
+        checkpoint.finalize_load(actor, payload)
+
+    assert actor.global_step == 5
+    assert actor.args.start_step == 6
+    synchronize.assert_called_once_with()
+    barrier.assert_called_once_with()
+    collect.assert_called_once_with()
+    empty_cache.assert_called_once_with()

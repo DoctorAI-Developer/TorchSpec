@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import time
 from pathlib import Path
@@ -331,6 +332,13 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
 
     torch.cuda.synchronize()
     dist.barrier()
+    # Distributed-checkpoint restore can leave multi-gigabyte temporary
+    # tensors in this actor's CUDA caching allocator.  A colocated inference
+    # engine profiles globally free memory immediately after actor init, so
+    # return those now-unused blocks before that profile instead of making the
+    # resume path appear to need a materially larger static-memory fraction.
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def save(actor: Any, step: int) -> None:

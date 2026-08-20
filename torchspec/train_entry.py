@@ -437,6 +437,14 @@ def train_async_no_generation(args):
             args, role="training", mooncake_config=mooncake_config, with_ref=False
         )
 
+        # Checkpoint loading has a temporary CUDA-memory peak.  Do not let a
+        # colocated SGLang worker profile its KV pool concurrently with that
+        # restore; the trainer releases restore-only cache before this wait
+        # completes.  Fresh runs retain parallel initialization.
+        if getattr(args, "load_path", None):
+            logger.info("Waiting for checkpoint restore before inference memory profiling...")
+            ray.get(train_init_refs)
+
         # Decode mode: create scratch draft checkpoint before inference engines
         # are prepared, since they need decode_speculative_draft_model_path on args.
         # This blocks on train actor init (FSDP gather), so inference engines are
