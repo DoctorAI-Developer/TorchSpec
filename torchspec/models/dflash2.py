@@ -173,8 +173,14 @@ class DFlash2Model(DFlashModel):
         logits: torch.Tensor,
         target_ids: torch.Tensor,
         objective_weights: torch.Tensor,
+        native_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
-        eligible_weights = objective_weights[..., 1:]
+        # Spec-AUF changes the unary token CE support only. DFlash2's candidate
+        # selector is a separate auxiliary objective, so retain its native-valid
+        # supervision rather than silently truncating it after the first unary
+        # mismatch. Other objectives preserve their historical weighting.
+        selector_weights = native_weights if self.loss_objective == "auf" else objective_weights
+        eligible_weights = selector_weights[..., 1:]
         eligible_weights = eligible_weights * (eligible_weights > 0).cumprod(dim=-1)
         if logits.shape != eligible_weights.shape:
             batch, num_blocks, block_size = target_ids.shape

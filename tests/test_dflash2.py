@@ -298,9 +298,7 @@ class TestDFlash2Config(unittest.TestCase):
             DFlash2Config(**_tiny_config_kwargs(conv_kernel_size=3))
 
         with self.assertRaisesRegex(ValueError, "sliding_window"):
-            DFlash2Config(
-                **_tiny_config_kwargs(layer_types=["sliding_attention"])
-            )
+            DFlash2Config(**_tiny_config_kwargs(layer_types=["sliding_attention"]))
 
         for target_layer_ids in ([1, 12], [-1, 9], []):
             with self.subTest(target_layer_ids=target_layer_ids):
@@ -540,7 +538,9 @@ class TestDFlash2Forward(unittest.TestCase):
         targets = torch.tensor([[[0, 1, 2, 3]]])
         weights = torch.tensor([[[0.0, 1.0, 0.5, 0.0]]])
 
-        extra_numerator, components = model._extra_training_loss(hidden, logits, targets, weights)
+        extra_numerator, components = model._extra_training_loss(
+            hidden, logits, targets, weights, weights
+        )
 
         first_ce = torch.logsumexp(torch.tensor([4.5, 1.0]), dim=0) - 1.0
         second_ce = torch.logsumexp(torch.tensor([7.0, 6.0]), dim=0) - 6.0
@@ -551,8 +551,39 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertEqual(component_denominator.item(), 1.5)
 
         gap_weights = torch.tensor([[[0.0, 1.0, 0.0, 1.0]]])
-        gap_numerator, _ = model._extra_training_loss(hidden, logits, targets, gap_weights)
+        gap_numerator, _ = model._extra_training_loss(
+            hidden, logits, targets, gap_weights, gap_weights
+        )
         self.assertTrue(torch.allclose(gap_numerator, 0.4 * first_ce, atol=1e-6))
+
+    def test_auf_masks_unary_ce_without_truncating_selector_supervision(self):
+        config = _make_config(block_size=4)
+        model = DFlash2Model(
+            DFlash2DraftModel(config),
+            block_size=4,
+            num_anchors=1,
+            selector_loss_alpha=0.4,
+            loss_objective="auf",
+        )
+        hidden = torch.zeros(1, 4, config.hidden_size)
+        targets = torch.tensor([[[0, 1, 2, 3]]])
+        # Compact selector-CE payload used by the chunked DFlash2 loss path.
+        selector_ce = torch.tensor([[[1.0, 2.0, 3.0]]])
+        auf_weights = torch.tensor([[[0.0, 1.0, 0.0, 0.0]]])
+        native_weights = torch.tensor([[[0.0, 1.0, 1.0, 1.0]]])
+
+        extra_numerator, components = model._extra_training_loss(
+            hidden,
+            selector_ce,
+            targets,
+            auf_weights,
+            native_weights,
+        )
+
+        self.assertTrue(torch.allclose(extra_numerator, torch.tensor(0.4 * 6.0)))
+        component_numerator, component_denominator = components["selector_loss"]
+        self.assertEqual(component_numerator.item(), 6.0)
+        self.assertEqual(component_denominator.item(), 3.0)
 
     def test_gradients_reach_convolutions_and_selector(self):
         torch.manual_seed(13)

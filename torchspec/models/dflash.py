@@ -330,6 +330,7 @@ class DFlashModel(nn.Module):
         logits: torch.Tensor,
         target_ids: torch.Tensor,
         objective_weights: torch.Tensor,
+        native_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
         return logits.new_zeros(()), {}
 
@@ -556,6 +557,7 @@ class DFlashModel(nn.Module):
             logits=logits,
             target_ids=target_ids,
             objective_weights=objective_weights,
+            native_weights=weight_mask,
         )
         loss_numerator = loss_numerator + extra_numerator
         loss = loss_numerator / loss_denominator.clamp(min=1e-6)
