@@ -72,6 +72,12 @@ _DFLASH = {
     "mask_token_id": 127,
 }
 
+_DFLASH2 = {
+    **_DFLASH,
+    "architectures": ["DFlash2DraftModel"],
+    "model_type": "qwen3_dflash2",
+}
+
 
 def _tmpdir(test: unittest.TestCase) -> Path:
     directory = tempfile.TemporaryDirectory()
@@ -166,6 +172,25 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
         save_file(tensors, str(directory / "model.safetensors"))
 
         fresh = _build(_DFLASH, seed=1)
+        original_embedding = fresh.embed_tokens.weight.detach().clone()
+        load_initial_draft_weights(fresh, str(directory))
+
+        expected = published.state_dict()
+        for key, value in fresh.state_dict().items():
+            if key == "embed_tokens.weight":
+                self.assertTrue(torch.equal(value, original_embedding))
+            else:
+                self.assertTrue(torch.equal(value, expected[key]), msg=f"{key} was not restored")
+
+    def test_loads_a_published_dflash2_draft_without_shared_embedding(self):
+        published = _build(_DFLASH2, seed=0)
+        tensors = to_export_keys(published.state_dict())
+        tensors.pop("embed_tokens.weight")
+        directory = self.tmpdir / "dflash2-no-embedding"
+        directory.mkdir()
+        save_file(tensors, str(directory / "model.safetensors"))
+
+        fresh = _build(_DFLASH2, seed=1)
         original_embedding = fresh.embed_tokens.weight.detach().clone()
         load_initial_draft_weights(fresh, str(directory))
 

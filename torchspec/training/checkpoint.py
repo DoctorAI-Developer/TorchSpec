@@ -33,6 +33,7 @@ from safetensors import safe_open
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
+from torchspec.models.draft.dflash import DFlashDraftModel
 from torchspec.models.draft.keymap import to_internal_keys
 from torchspec.utils.logging import logger
 
@@ -154,7 +155,7 @@ def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
     incompatible = draft_model.load_state_dict(tensors, strict=False)
     allowed_missing = (
         {"embed_tokens.weight"}
-        if draft_model.__class__.__name__ == "DFlashDraftModel"
+        if isinstance(draft_model, DFlashDraftModel)
         else set()
     )
     missing = set(incompatible.missing_keys) - allowed_missing
