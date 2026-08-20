@@ -26,7 +26,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from torchspec.models.dflash import DFlashModel, _likelihood_overlap_loss
+from torchspec.models.dflash import (
+    DFlashModel,
+    _likelihood_overlap_loss,
+    _total_variation_loss,
+)
 
 
 class DFlash2Model(DFlashModel):
@@ -124,7 +128,7 @@ class DFlash2Model(DFlashModel):
         ce_chunks = []
         pred_chunks = []
         selector_ce_chunks = []
-        likelihood_overlap_chunks = []
+        distribution_loss_chunks = []
 
         def compute_chunk(
             hidden: torch.Tensor,
@@ -155,16 +159,20 @@ class DFlash2Model(DFlashModel):
                 target_indices.reshape(-1),
                 reduction="none",
             ).reshape_as(target_indices)
-            likelihood_overlap_loss = ce.new_empty(0)
-            if self.loss_objective == "lk":
+            distribution_loss = ce.new_empty(0)
+            if self.loss_objective in {"lk", "tv"}:
                 if target_hidden is None:
-                    raise ValueError("DFlash LK requires aligned target hidden states")
+                    raise ValueError(
+                        "DFlash distribution training requires aligned target hidden states"
+                    )
                 target_logits = F.linear(target_hidden, lm_head_weight)
-                likelihood_overlap_loss = _likelihood_overlap_loss(
-                    chunk_logits,
-                    target_logits,
+                objective = (
+                    _likelihood_overlap_loss
+                    if self.loss_objective == "lk"
+                    else _total_variation_loss
                 )
-            return ce, pred, selector_ce, likelihood_overlap_loss
+                distribution_loss = objective(chunk_logits, target_logits)
+            return ce, pred, selector_ce, distribution_loss
 
         for start in range(0, num_blocks, blocks_per_chunk):
             stop = min(start + blocks_per_chunk, num_blocks)
@@ -174,7 +182,7 @@ class DFlash2Model(DFlashModel):
                 None if target_hidden_blocks is None else target_hidden_blocks[:, start:stop]
             )
             if self.training and hidden_chunk.requires_grad:
-                ce, pred, selector_ce, likelihood_overlap_loss = torch_checkpoint(
+                ce, pred, selector_ce, distribution_loss = torch_checkpoint(
                     compute_chunk,
                     hidden_chunk,
                     target_chunk,
@@ -182,7 +190,7 @@ class DFlash2Model(DFlashModel):
                     use_reentrant=False,
                 )
             else:
-                ce, pred, selector_ce, likelihood_overlap_loss = compute_chunk(
+                ce, pred, selector_ce, distribution_loss = compute_chunk(
                     hidden_chunk,
                     target_chunk,
                     target_hidden_chunk,
@@ -190,18 +198,18 @@ class DFlash2Model(DFlashModel):
             ce_chunks.append(ce)
             pred_chunks.append(pred)
             selector_ce_chunks.append(selector_ce)
-            if self.loss_objective == "lk":
-                likelihood_overlap_chunks.append(likelihood_overlap_loss)
+            if self.loss_objective in {"lk", "tv"}:
+                distribution_loss_chunks.append(distribution_loss)
 
         ce_per_token = torch.cat(ce_chunks, dim=1).reshape(-1)
         pred_ids = torch.cat(pred_chunks, dim=1).reshape(-1)
         selector_ce = torch.cat(selector_ce_chunks, dim=1)
-        likelihood_overlap_loss = (
-            torch.cat(likelihood_overlap_chunks, dim=1).reshape(-1)
-            if likelihood_overlap_chunks
+        distribution_loss = (
+            torch.cat(distribution_loss_chunks, dim=1).reshape(-1)
+            if distribution_loss_chunks
             else None
         )
-        return ce_per_token, pred_ids, selector_ce, likelihood_overlap_loss
+        return ce_per_token, pred_ids, selector_ce, distribution_loss
 
     def _extra_training_loss(
         self,

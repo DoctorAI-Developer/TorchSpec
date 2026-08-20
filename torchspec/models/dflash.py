@@ -35,7 +35,24 @@ import torch.nn.functional as F
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
 from torchspec.utils.logging import logger
 
-_VALID_DFLASH_LOSS_OBJECTIVES = {"auf", "decay", "dpace", "lk"}
+_VALID_DFLASH_LOSS_OBJECTIVES = {"auf", "decay", "dpace", "lk", "tv"}
+
+
+def _distribution_overlap(
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``sum_x min(p(x), q(x))`` with a detached FP32 target."""
+    if draft_logits.shape != target_logits.shape:
+        raise ValueError(
+            "draft and target logits must have identical shapes, got "
+            f"{tuple(draft_logits.shape)} and {tuple(target_logits.shape)}"
+        )
+
+    with torch.no_grad():
+        target_probs = torch.softmax(target_logits.float(), dim=-1)
+    draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+    return torch.minimum(target_probs, draft_probs).sum(dim=-1)
 
 
 def _likelihood_overlap_loss(
@@ -50,17 +67,16 @@ def _likelihood_overlap_loss(
     directly.  The verifier distribution is a frozen target; gradients flow
     only through the draft distribution.
     """
-    if draft_logits.shape != target_logits.shape:
-        raise ValueError(
-            "draft and target logits must have identical shapes, got "
-            f"{tuple(draft_logits.shape)} and {tuple(target_logits.shape)}"
-        )
-
-    with torch.no_grad():
-        target_probs = torch.softmax(target_logits.float(), dim=-1)
-    draft_probs = torch.softmax(draft_logits.float(), dim=-1)
-    overlap = torch.minimum(target_probs, draft_probs).sum(dim=-1)
+    overlap = _distribution_overlap(draft_logits, target_logits)
     return -torch.log(overlap.clamp_min(torch.finfo(overlap.dtype).tiny))
+
+
+def _total_variation_loss(
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Directly maximize one-step acceptance via total variation distance."""
+    return 1.0 - _distribution_overlap(draft_logits, target_logits)
 
 
 def _auf_position_mask(
@@ -196,21 +212,23 @@ class DFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
-        if self.loss_objective == "lk":
+        if self.loss_objective in {"lk", "tv"}:
+            objective_name = self.loss_objective.upper()
             if self.ce_loss_alpha != 0:
                 raise ValueError(
-                    "DFlash LK uses likelihood overlap as the complete unary objective; "
+                    f"DFlash {objective_name} uses distribution overlap as the complete "
+                    "unary objective; "
                     "set dflash_ce_loss_alpha=0"
                 )
             if self.l1_loss_alpha != 0:
                 raise ValueError(
-                    "DFlash LK cannot be combined with L1 distillation; "
+                    f"DFlash {objective_name} cannot be combined with L1 distillation; "
                     "set dflash_l1_loss_alpha=0"
                 )
 
     @property
     def uses_target_hidden_states(self) -> bool:
-        return self.l1_loss_alpha > 0 or self.loss_objective == "lk"
+        return self.l1_loss_alpha > 0 or self.loss_objective in {"lk", "tv"}
 
     def _sample_anchor_positions(
         self,
@@ -347,12 +365,12 @@ class DFlashModel(nn.Module):
         target_ids: torch.Tensor,
         aligned_target_hidden: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Return per-token CE, predicted IDs, logits payload, and LK loss.
+        """Return per-token CE, predicted IDs, logits payload, and distribution loss.
 
         Subclasses may return a compact third payload when their auxiliary
         objective can be computed without retaining the full vocabulary
         matrix. The base DFlash L1 path still requires full logits.  The fourth
-        value is populated only for the likelihood-overlap objective.
+        value is populated only for LK or direct total-variation training.
         """
         logits = self._compute_logits(draft_hidden, lm_head_weight)
         flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -360,16 +378,18 @@ class DFlashModel(nn.Module):
         ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
-        likelihood_overlap_loss = None
-        if self.loss_objective == "lk":
+        distribution_loss = None
+        if self.loss_objective in {"lk", "tv"}:
             if aligned_target_hidden is None:
-                raise ValueError("DFlash LK requires aligned target hidden states")
+                raise ValueError("DFlash distribution training requires aligned target hidden states")
             target_logits = F.linear(aligned_target_hidden, lm_head_weight)
-            likelihood_overlap_loss = _likelihood_overlap_loss(
-                flat_logits,
-                target_logits.reshape_as(flat_logits),
+            objective = (
+                _likelihood_overlap_loss
+                if self.loss_objective == "lk"
+                else _total_variation_loss
             )
-        return ce_per_token, pred_ids, logits, likelihood_overlap_loss
+            distribution_loss = objective(flat_logits, target_logits.reshape_as(flat_logits))
+        return ce_per_token, pred_ids, logits, distribution_loss
 
     def _extra_training_loss(
         self,
@@ -514,8 +534,8 @@ class DFlashModel(nn.Module):
         if self.uses_target_hidden_states:
             if last_hidden_states is None:
                 requirement = (
-                    "DFlash LK"
-                    if self.loss_objective == "lk"
+                    f"DFlash {self.loss_objective.upper()}"
+                    if self.loss_objective in {"lk", "tv"}
                     else "DFlash L1 distillation (l1_loss_alpha > 0)"
                 )
                 raise ValueError(
@@ -529,7 +549,7 @@ class DFlashModel(nn.Module):
 
         # 8. Project through the frozen LM head. DFlash2 can override this hook
         # with an exact chunked path to bound the full-vocabulary peak.
-        ce_per_token, pred_ids, logits, likelihood_overlap_loss = self._compute_token_statistics(
+        ce_per_token, pred_ids, logits, distribution_loss = self._compute_token_statistics(
             draft_hidden,
             lm_head_weight,
             target_ids,
@@ -557,14 +577,17 @@ class DFlashModel(nn.Module):
         # our objective weighting is an addition to the training signal, not the metric.
         binary_eval_mask = weight_mask.view(-1)
 
-        # 9. Per-token unary objective. LK replaces CE/L1 rather than blending
-        # them, matching Kimi K3's temperature-1 likelihood-overlap objective.
+        # 9. Per-token unary objective. Distribution objectives replace CE/L1
+        # rather than blending them. LK is Kimi K3's geometric objective; TV
+        # directly maximizes arithmetic one-step acceptance.
         flat_targets = target_ids.view(-1)
 
-        if self.loss_objective == "lk":
-            if likelihood_overlap_loss is None:
-                raise RuntimeError("DFlash LK token statistics did not return overlap loss")
-            loss_per_token = likelihood_overlap_loss
+        if self.loss_objective in {"lk", "tv"}:
+            if distribution_loss is None:
+                raise RuntimeError(
+                    "DFlash distribution token statistics did not return overlap loss"
+                )
+            loss_per_token = distribution_loss
         else:
             loss_per_token = self.ce_loss_alpha * ce_per_token
         if self.l1_loss_alpha > 0:

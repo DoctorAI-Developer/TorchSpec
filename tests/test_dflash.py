@@ -22,6 +22,7 @@ from torchspec.models.dflash import (
     _create_dflash_mask_mod,
     _dpace_position_weights,
     _likelihood_overlap_loss,
+    _total_variation_loss,
 )
 from torchspec.models.draft.dflash import (
     DFlashConfig,
@@ -108,6 +109,14 @@ class TestLikelihoodOverlapLoss(unittest.TestCase):
         loss = _likelihood_overlap_loss(draft_logits, target_logits)
 
         self.assertAlmostEqual(loss.item(), math.log(2.0), places=6)
+
+    def test_total_variation_directly_penalizes_missing_overlap(self):
+        draft_logits = torch.tensor([[0.0, 0.0]])
+        target_logits = torch.tensor([[80.0, -80.0]])
+
+        loss = _total_variation_loss(draft_logits, target_logits)
+
+        self.assertAlmostEqual(loss.item(), 0.5, places=6)
 
     def test_target_distribution_is_detached(self):
         draft_logits = torch.tensor([[0.3, -0.2, 1.1]], requires_grad=True)
@@ -681,6 +690,12 @@ class TestDFlashModelForward(unittest.TestCase):
                 ce_loss_alpha=0,
                 l1_loss_alpha=0.5,
             )
+
+    def test_tv_requires_unblended_unary_objective(self):
+        with self.assertRaisesRegex(ValueError, "dflash_ce_loss_alpha=0"):
+            _make_dflash_model(loss_objective="tv")
+        model = _make_dflash_model(loss_objective="tv", ce_loss_alpha=0)
+        self.assertTrue(model.uses_target_hidden_states)
 
     def test_lk_requires_target_hidden_states(self):
         model = _make_dflash_model(

@@ -666,44 +666,60 @@ class TestDFlash2Forward(unittest.TestCase):
                     msg=name,
                 )
 
-    def test_chunked_lk_matches_full_loss_and_gradients(self):
-        full_model = _make_model(
-            logits_chunk_size=0,
-            loss_objective="lk",
-            ce_loss_alpha=0,
-        )
-        chunked_model = _make_model(
-            logits_chunk_size=4,
-            loss_objective="lk",
-            ce_loss_alpha=0,
-        )
-        chunked_model.load_state_dict(full_model.state_dict())
-        batch = _batch(seed=31, with_last_hidden_states=True)
-
-        torch.manual_seed(37)
-        full_result = full_model(**batch)
-        torch.manual_seed(37)
-        chunked_result = chunked_model(**batch)
-
-        for full_value, chunked_value in zip(full_result[:5], chunked_result[:5]):
-            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
-        for key in full_result[5]:
-            for full_value, chunked_value in zip(full_result[5][key], chunked_result[5][key]):
-                self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
-        for full_value, chunked_value in zip(full_result[6], chunked_result[6]):
-            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
-
-        full_result[0].backward()
-        chunked_result[0].backward()
-        for name, full_param in full_model.named_parameters():
-            chunked_param = dict(chunked_model.named_parameters())[name]
-            if full_param.grad is None:
-                self.assertIsNone(chunked_param.grad, msg=name)
-            else:
-                self.assertTrue(
-                    torch.allclose(full_param.grad, chunked_param.grad, atol=1e-5, rtol=1e-5),
-                    msg=name,
+    def test_chunked_distribution_losses_match_full_loss_and_gradients(self):
+        for objective in ("lk", "tv"):
+            with self.subTest(objective=objective):
+                full_model = _make_model(
+                    logits_chunk_size=0,
+                    loss_objective=objective,
+                    ce_loss_alpha=0,
                 )
+                chunked_model = _make_model(
+                    logits_chunk_size=4,
+                    loss_objective=objective,
+                    ce_loss_alpha=0,
+                )
+                chunked_model.load_state_dict(full_model.state_dict())
+                batch = _batch(seed=31, with_last_hidden_states=True)
+
+                torch.manual_seed(37)
+                full_result = full_model(**batch)
+                torch.manual_seed(37)
+                chunked_result = chunked_model(**batch)
+
+                for full_value, chunked_value in zip(full_result[:5], chunked_result[:5]):
+                    self.assertTrue(
+                        torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
+                    )
+                for key in full_result[5]:
+                    for full_value, chunked_value in zip(
+                        full_result[5][key], chunked_result[5][key]
+                    ):
+                        self.assertTrue(
+                            torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
+                        )
+                for full_value, chunked_value in zip(full_result[6], chunked_result[6]):
+                    self.assertTrue(
+                        torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
+                    )
+
+                full_result[0].backward()
+                chunked_result[0].backward()
+                chunked_parameters = dict(chunked_model.named_parameters())
+                for name, full_param in full_model.named_parameters():
+                    chunked_param = chunked_parameters[name]
+                    if full_param.grad is None:
+                        self.assertIsNone(chunked_param.grad, msg=name)
+                    else:
+                        self.assertTrue(
+                            torch.allclose(
+                                full_param.grad,
+                                chunked_param.grad,
+                                atol=1e-5,
+                                rtol=1e-5,
+                            ),
+                            msg=name,
+                        )
 
     def test_all_masked_batch_has_zero_losses(self):
         loss, _, _, _, _, components, loss_terms = self.model(**_batch(all_masked=True))
