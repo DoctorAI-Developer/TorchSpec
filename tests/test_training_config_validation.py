@@ -75,6 +75,45 @@ def test_load_config_rejects_invalid_opd_accepted_objective():
         load_config(base_config=base)
 
 
+def test_load_config_rejects_invalid_dflash2_selector_objective():
+    base = _resolved_training_config(dflash2_selector_objective="unsupported")
+    with pytest.raises(ValueError, match="dflash2_selector_objective"):
+        load_config(base_config=base)
+
+
+def test_load_config_requires_sampling_selector_map_and_opd():
+    missing_map = _resolved_training_config(
+        dflash_loss_objective="opd",
+        dflash_ce_loss_alpha=0,
+        dflash2_selector_objective="sampling_path",
+    )
+    with pytest.raises(ValueError, match="require both"):
+        load_config(base_config=missing_map)
+
+    wrong_objective = _resolved_training_config(
+        dflash2_selector_objective="sampling_tv",
+        dflash2_selector_token_map_path="/tmp/map.pt",
+        dflash2_selector_token_map_sha256="0" * 64,
+    )
+    with pytest.raises(ValueError, match="dflash_loss_objective=opd"):
+        load_config(base_config=wrong_objective)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("dflash2_selector_temperature", 0.0, "selector_temperature"),
+        ("dflash2_selector_verifier_temperature", -1.0, "verifier_temperature"),
+        ("dflash2_selector_verifier_top_k", 0, "verifier_top_k"),
+        ("dflash2_selector_verifier_top_p", 0.0, "verifier_top_p"),
+    ),
+)
+def test_load_config_rejects_invalid_selector_sampling_values(field, value, message):
+    base = _resolved_training_config(**{field: value})
+    with pytest.raises(ValueError, match=message):
+        load_config(base_config=base)
+
+
 # --- Numeric training-config fields (draft_accumulation_steps, learning_rate,
 #     max_grad_norm) and inference_batch_size — PR #171 idiom extended. ---
 

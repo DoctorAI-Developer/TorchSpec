@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -55,6 +56,13 @@ from torchspec.models.draft.dflash2 import (
 from torchspec.training.trainer_actor import _trainer_class_for_config
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_selector_map(directory: str, token_ids: torch.Tensor) -> tuple[str, str]:
+    path = Path(directory, "selector-token-map.pt")
+    torch.save(token_ids, path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return str(path), digest
 
 
 def _load_dflash2_trainer():
@@ -136,6 +144,13 @@ def _make_model(
     ce_loss_alpha=1.0,
     opd_rejected_k3_preserve_negative_tail=False,
     opd_accepted_objective="forward_kl",
+    selector_objective="teacher_ce",
+    selector_token_map_path=None,
+    selector_token_map_sha256=None,
+    selector_temperature=1.0,
+    selector_verifier_temperature=1.0,
+    selector_verifier_top_k=20,
+    selector_verifier_top_p=0.95,
 ):
     config = _make_config()
     draft = DFlash2DraftModel(config).to(dtype=torch.float32)
@@ -149,6 +164,13 @@ def _make_model(
         ce_loss_alpha=ce_loss_alpha,
         logits_chunk_size=logits_chunk_size,
         selector_loss_alpha=selector_loss_alpha,
+        selector_objective=selector_objective,
+        selector_token_map_path=selector_token_map_path,
+        selector_token_map_sha256=selector_token_map_sha256,
+        selector_temperature=selector_temperature,
+        selector_verifier_temperature=selector_verifier_temperature,
+        selector_verifier_top_k=selector_verifier_top_k,
+        selector_verifier_top_p=selector_verifier_top_p,
         opd_rejected_k3_preserve_negative_tail=(
             opd_rejected_k3_preserve_negative_tail
         ),
@@ -610,6 +632,218 @@ class TestDFlash2Forward(unittest.TestCase):
         component_numerator, component_denominator = components["selector_loss"]
         self.assertEqual(component_numerator.item(), 6.0)
         self.assertEqual(component_denominator.item(), 3.0)
+
+    def test_sampling_selector_uses_exact_map_and_verifier_transform(self):
+        config = _make_config(
+            hidden_size=4,
+            vocab_size=4,
+            num_target_layers=1,
+            selector_rank=2,
+            selector_top_k=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.tensor([0, 1, 2], dtype=torch.int64),
+            )
+            model = DFlash2Model(
+                DFlash2DraftModel(config),
+                block_size=4,
+                num_anchors=1,
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_tv",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+                selector_verifier_top_k=2,
+                selector_verifier_top_p=1.0,
+            )
+        selector = model.draft_model.candidate_selector
+        with torch.no_grad():
+            selector.hidden_projection.weight.zero_()
+            selector.predecessor_codebook.zero_()
+            selector.successor_codebook.zero_()
+
+        hidden = torch.ones(1, 2, 4)
+        draft_logits = torch.tensor(
+            [[[3.0, 2.0, 0.0, 100.0], [2.0, 3.0, 0.0, 100.0]]],
+            requires_grad=True,
+        )
+        target_logits = torch.tensor(
+            [[[2.5, 2.0, -4.0, -4.0], [1.5, 2.5, -4.0, -4.0]]]
+        )
+        predecessor_ids = torch.tensor([[2, 1]])
+
+        actual = model._selector_sampling_overlap(
+            hidden,
+            draft_logits,
+            target_logits,
+            predecessor_ids,
+        )
+        expected = torch.stack(
+            (
+                torch.minimum(
+                    torch.softmax(torch.tensor([3.0, 2.0]), dim=-1),
+                    torch.softmax(torch.tensor([2.5, 2.0]), dim=-1),
+                ).sum(),
+                torch.minimum(
+                    torch.softmax(torch.tensor([2.0, 3.0]), dim=-1),
+                    torch.softmax(torch.tensor([1.5, 2.5]), dim=-1),
+                ).sum(),
+            )
+        ).unsqueeze(0)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        (1.0 - actual).sum().backward()
+        self.assertGreater(draft_logits.grad[..., :3].abs().sum(), 0)
+        self.assertEqual(draft_logits.grad[..., 3].abs().sum().item(), 0.0)
+
+    def test_sampling_path_loss_matches_prefix_survival(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            model = _make_model(
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_path",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+            )
+        overlap = torch.tensor([[[0.5, 0.5, 0.5]]], requires_grad=True)
+        weights = torch.tensor([[[0.0, 1.0, 1.0, 1.0]]])
+
+        extra_numerator, components = model._extra_training_loss(
+            torch.zeros(1, 4, 16),
+            overlap,
+            torch.zeros(1, 1, 4, dtype=torch.long),
+            weights,
+            weights,
+        )
+
+        expected_unweighted = torch.tensor((1 - 0.5) + (1 - 0.25) + (1 - 0.125))
+        self.assertTrue(
+            torch.allclose(extra_numerator, model.selector_loss_alpha * expected_unweighted)
+        )
+        selector_num, selector_den = components["selector_loss"]
+        self.assertTrue(torch.allclose(selector_num, expected_unweighted))
+        self.assertEqual(selector_den.item(), 3.0)
+        overlap_num, overlap_den = components["selector_overlap"]
+        self.assertEqual(overlap_num.item(), 1.5)
+        self.assertEqual(overlap_den.item(), 3.0)
+        extra_numerator.backward()
+        self.assertTrue(torch.isfinite(overlap.grad).all())
+        self.assertTrue((overlap.grad < 0).all())
+
+    def test_sampling_selector_chunked_statistics_match_full_gradients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            common = {
+                "loss_objective": "opd",
+                "ce_loss_alpha": 0,
+                "opd_accepted_objective": "tv",
+                "selector_objective": "sampling_path",
+                "selector_token_map_path": map_path,
+                "selector_token_map_sha256": map_sha256,
+                "selector_verifier_top_k": 8,
+            }
+            full_model = _make_model(logits_chunk_size=0, **common)
+            chunked_model = _make_model(logits_chunk_size=4, **common)
+        chunked_model.load_state_dict(full_model.state_dict())
+        generator = torch.Generator().manual_seed(211)
+        full_hidden = torch.randn(2, 8, 16, generator=generator, requires_grad=True)
+        chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
+        target_hidden = torch.randn(2, 8, 16, generator=generator)
+        target_ids = torch.randint(0, 32, (2, 2, 4), generator=generator)
+        full_head = torch.randn(32, 16, generator=generator, requires_grad=True)
+        chunked_head = full_head.detach().clone().requires_grad_(True)
+
+        full_result = full_model._compute_token_statistics(
+            full_hidden,
+            full_head,
+            target_ids,
+            target_hidden,
+        )
+        chunked_result = chunked_model._compute_token_statistics(
+            chunked_hidden,
+            chunked_head,
+            target_ids,
+            target_hidden,
+        )
+
+        for full_value, chunked_value in zip(full_result, chunked_result, strict=True):
+            self.assertTrue(
+                torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
+            )
+        (full_result[0].sum() + full_result[2].sum() + full_result[3].sum()).backward()
+        (
+            chunked_result[0].sum()
+            + chunked_result[2].sum()
+            + chunked_result[3].sum()
+        ).backward()
+        self.assertTrue(
+            torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5)
+        )
+        self.assertTrue(
+            torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5)
+        )
+        chunked_parameters = dict(chunked_model.named_parameters())
+        for name, full_parameter in full_model.named_parameters():
+            chunked_parameter = chunked_parameters[name]
+            if full_parameter.grad is None:
+                self.assertIsNone(chunked_parameter.grad, msg=name)
+            else:
+                self.assertTrue(
+                    torch.allclose(
+                        full_parameter.grad,
+                        chunked_parameter.grad,
+                        atol=1e-5,
+                        rtol=1e-5,
+                    ),
+                    msg=name,
+                )
+
+    def test_sampling_selector_map_is_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "require both"):
+            _make_model(
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_path",
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                _make_model(
+                    loss_objective="opd",
+                    ce_loss_alpha=0,
+                    selector_objective="sampling_path",
+                    selector_token_map_path=map_path,
+                    selector_token_map_sha256="0" * 64,
+                )
+            unsorted_path, unsorted_sha256 = _write_selector_map(
+                directory,
+                torch.tensor([0, 2, 1, *range(3, 16)], dtype=torch.int64),
+            )
+            with self.assertRaisesRegex(ValueError, "strictly increasing"):
+                _make_model(
+                    loss_objective="opd",
+                    ce_loss_alpha=0,
+                    selector_objective="sampling_path",
+                    selector_token_map_path=unsorted_path,
+                    selector_token_map_sha256=unsorted_sha256,
+                )
+            with self.assertRaisesRegex(ValueError, "require a sampling-aligned"):
+                _make_model(
+                    selector_token_map_path=map_path,
+                    selector_token_map_sha256=map_sha256,
+                )
 
     def test_gradients_reach_convolutions_and_selector(self):
         torch.manual_seed(13)

@@ -29,12 +29,33 @@ from torchspec.training.dflash_trainer import DFlashTrainer
 
 class DFlash2Trainer(DFlashTrainer):
     _draft_config_class = DFlash2Config
-    _extra_loss_component_keys = ["selector_loss", "opd_rejected_loss"]
+    _extra_loss_component_keys = [
+        "selector_loss",
+        "selector_overlap",
+        "opd_rejected_loss",
+    ]
 
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.logits_chunk_size = getattr(args, "dflash2_logits_chunk_size", 0)
         self.selector_loss_alpha = getattr(args, "dflash2_selector_loss_alpha", 1.0)
+        self.selector_objective = getattr(args, "dflash2_selector_objective", "teacher_ce")
+        self.selector_token_map_path = getattr(
+            args, "dflash2_selector_token_map_path", None
+        )
+        self.selector_token_map_sha256 = getattr(
+            args, "dflash2_selector_token_map_sha256", None
+        )
+        self.selector_temperature = getattr(args, "dflash2_selector_temperature", 1.0)
+        self.selector_verifier_temperature = getattr(
+            args, "dflash2_selector_verifier_temperature", 1.0
+        )
+        self.selector_verifier_top_k = getattr(
+            args, "dflash2_selector_verifier_top_k", 20
+        )
+        self.selector_verifier_top_p = getattr(
+            args, "dflash2_selector_verifier_top_p", 0.95
+        )
         self.opd_rejected_stream_weight = getattr(args, "dflash2_opd_rejected_stream_weight", 1.0)
         self.opd_rejected_position_decay = getattr(args, "dflash2_opd_rejected_position_decay", 0.8)
         self.opd_rejected_k3_preserve_negative_tail = getattr(
@@ -70,6 +91,13 @@ class DFlash2Trainer(DFlashTrainer):
             l1_loss_alpha=self.l1_loss_alpha,
             logits_chunk_size=self.logits_chunk_size,
             selector_loss_alpha=self.selector_loss_alpha,
+            selector_objective=self.selector_objective,
+            selector_token_map_path=self.selector_token_map_path,
+            selector_token_map_sha256=self.selector_token_map_sha256,
+            selector_temperature=self.selector_temperature,
+            selector_verifier_temperature=self.selector_verifier_temperature,
+            selector_verifier_top_k=self.selector_verifier_top_k,
+            selector_verifier_top_p=self.selector_verifier_top_p,
             opd_rejected_stream_weight=self.opd_rejected_stream_weight,
             opd_rejected_position_decay=self.opd_rejected_position_decay,
             opd_rejected_k3_preserve_negative_tail=(

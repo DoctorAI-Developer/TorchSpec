@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import argparse
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -164,6 +165,16 @@ class TrainingConfig:
     # DFlash2-specific parameters (used by DFlash2 trainer only)
     dflash2_logits_chunk_size: int = 0
     dflash2_selector_loss_alpha: float = 1.0
+    # teacher_ce exactly preserves existing behavior. sampling_tv optimizes
+    # one-step overlap on the deployed reduced-head/top-16 distribution;
+    # sampling_path optimizes its differentiable accepted-prefix survival.
+    dflash2_selector_objective: str = "teacher_ce"
+    dflash2_selector_token_map_path: Optional[str] = None
+    dflash2_selector_token_map_sha256: Optional[str] = None
+    dflash2_selector_temperature: float = 1.0
+    dflash2_selector_verifier_temperature: float = 1.0
+    dflash2_selector_verifier_top_k: int = 20
+    dflash2_selector_verifier_top_p: float = 0.95
     dflash2_opd_rejected_stream_weight: float = 1.0
     dflash2_opd_rejected_position_decay: float = 0.8
     # Preserve K3's exact, bounded-gradient negative tail while retaining the
@@ -343,6 +354,55 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
             "dflash2_logits_chunk_size must be >= 0 "
             f"(got {config.training.dflash2_logits_chunk_size}); 0 disables chunking"
         )
+    selector_objective = config.training.dflash2_selector_objective
+    if selector_objective not in {"teacher_ce", "sampling_tv", "sampling_path"}:
+        raise ValueError(
+            "dflash2_selector_objective must be one of teacher_ce, sampling_tv, "
+            "or sampling_path"
+        )
+    selector_map_path = config.training.dflash2_selector_token_map_path
+    selector_map_sha256 = config.training.dflash2_selector_token_map_sha256
+    if selector_objective == "teacher_ce":
+        if selector_map_path is not None or selector_map_sha256 is not None:
+            raise ValueError(
+                "DFlash2 selector token-map fields require a sampling-aligned "
+                "selector objective"
+            )
+    else:
+        if config.training.dflash_loss_objective != "opd":
+            raise ValueError(
+                "sampling-aligned DFlash2 selector objectives require "
+                "dflash_loss_objective=opd"
+            )
+        if not selector_map_path or not selector_map_sha256:
+            raise ValueError(
+                "sampling-aligned DFlash2 selector objectives require both "
+                "dflash2_selector_token_map_path and "
+                "dflash2_selector_token_map_sha256"
+            )
+        expected_sha256 = str(selector_map_sha256).lower()
+        if len(expected_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in expected_sha256
+        ):
+            raise ValueError(
+                "dflash2_selector_token_map_sha256 must be 64 lowercase hex characters"
+            )
+    if (
+        not 0 < config.training.dflash2_selector_temperature
+        or not math.isfinite(config.training.dflash2_selector_temperature)
+    ):
+        raise ValueError("dflash2_selector_temperature must be finite and positive")
+    if (
+        config.training.dflash2_selector_verifier_temperature < 0
+        or not math.isfinite(config.training.dflash2_selector_verifier_temperature)
+    ):
+        raise ValueError(
+            "dflash2_selector_verifier_temperature must be finite and non-negative"
+        )
+    if config.training.dflash2_selector_verifier_top_k < 1:
+        raise ValueError("dflash2_selector_verifier_top_k must be positive")
+    if not 0 < config.training.dflash2_selector_verifier_top_p <= 1:
+        raise ValueError("dflash2_selector_verifier_top_p must be in (0, 1]")
     if config.training.dflash2_opd_rejected_stream_weight < 0:
         raise ValueError("dflash2_opd_rejected_stream_weight must be non-negative")
     if not 0 < config.training.dflash2_opd_rejected_position_decay <= 1:
