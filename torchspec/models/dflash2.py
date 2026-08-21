@@ -1202,7 +1202,7 @@ class DFlash2Model(DFlashModel):
             distribution_loss = ce.new_empty(0)
             target_logits = None
             if (
-                self.loss_objective in {"lk", "opd", "path", "tv"}
+                self.loss_objective in {"hybrid_lk", "lk", "opd", "path", "tv"}
                 or self.selector_objective != "teacher_ce"
             ):
                 if target_hidden is None:
@@ -1261,7 +1261,7 @@ class DFlash2Model(DFlashModel):
                     if self.selector_objective == "sampling_tv"
                     else selector_overlap
                 )
-            if self.loss_objective in {"lk", "opd", "path", "tv"}:
+            if self.loss_objective in {"hybrid_lk", "lk", "opd", "path", "tv"}:
                 distribution_loss = self._distribution_token_loss(
                     chunk_logits,
                     target_logits,
@@ -1293,7 +1293,7 @@ class DFlash2Model(DFlashModel):
             ce_chunks.append(ce)
             pred_chunks.append(pred)
             selector_payload_chunks.append(selector_payload)
-            if self.loss_objective in {"lk", "opd", "path", "tv"}:
+            if self.loss_objective in {"hybrid_lk", "lk", "opd", "path", "tv"}:
                 distribution_loss_chunks.append(distribution_loss)
 
         ce_per_token = torch.cat(ce_chunks, dim=1).reshape(-1)

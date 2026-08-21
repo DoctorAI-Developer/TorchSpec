@@ -160,8 +160,10 @@ class TrainingConfig:
     # DFlash-specific parameters (ignored for Eagle3 training)
     dflash_block_size: int = 16
     dflash_dpace_alpha: float = 0.5
+    # AngelSpec hybrid LK schedule: lambda=exp(-eta*acceptance_overlap).
+    dflash_lk_eta: float = 3.0
     dflash_loss_decay_gamma: float = 7.0
-    # "decay", "dpace", "auf", "lk", "path", "tv", or "opd"
+    # "decay", "dpace", "auf", "hybrid_lk", "lk", "path", "tv", or "opd"
     dflash_loss_objective: str = "decay"
     dflash_ce_loss_alpha: float = 1.0
     dflash_l1_loss_alpha: float = 0.0

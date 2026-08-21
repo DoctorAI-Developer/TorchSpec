@@ -113,6 +113,7 @@ class DFlash2Trainer(DFlashTrainer):
             num_anchors=self.num_anchors,
             loss_objective=self.loss_objective,
             dpace_alpha=self.dpace_alpha,
+            lk_eta=self.lk_eta,
             loss_decay_gamma=self.loss_decay_gamma,
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,

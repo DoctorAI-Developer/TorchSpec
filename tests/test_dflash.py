@@ -21,6 +21,7 @@ from torchspec.models.dflash import (
     _auf_position_mask,
     _create_dflash_mask_mod,
     _dpace_position_weights,
+    _hybrid_likelihood_overlap_loss,
     _likelihood_overlap_loss,
     _path_overlap_position_weights,
     _total_variation_loss,
@@ -68,6 +69,7 @@ def _make_dflash_model(
     num_anchors=4,
     loss_objective="decay",
     dpace_alpha=0.5,
+    lk_eta=3.0,
     ce_loss_alpha=1.0,
     l1_loss_alpha=0.0,
 ):
@@ -89,6 +91,7 @@ def _make_dflash_model(
         num_anchors=num_anchors,
         loss_objective=loss_objective,
         dpace_alpha=dpace_alpha,
+        lk_eta=lk_eta,
         loss_decay_gamma=7.0,
         ce_loss_alpha=ce_loss_alpha,
         l1_loss_alpha=l1_loss_alpha,
@@ -118,6 +121,48 @@ class TestLikelihoodOverlapLoss(unittest.TestCase):
         loss = _total_variation_loss(draft_logits, target_logits)
 
         self.assertAlmostEqual(loss.item(), 0.5, places=6)
+
+    def test_hybrid_lk_matches_detached_kl_tv_schedule(self):
+        draft_logits = torch.tensor([[0.2, -0.4, 1.1]], requires_grad=True)
+        target_logits = torch.tensor([[1.2, -0.5, 0.3]], requires_grad=True)
+        eta = 3.0
+
+        actual = _hybrid_likelihood_overlap_loss(
+            draft_logits,
+            target_logits,
+            eta=eta,
+        )
+        with torch.no_grad():
+            target_probs = torch.softmax(target_logits, dim=-1)
+            draft_log_probs = torch.log_softmax(draft_logits, dim=-1)
+            draft_probs = draft_log_probs.exp()
+            tv = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
+            kl = (target_probs * (target_probs.log() - draft_log_probs)).sum(dim=-1)
+            blend = torch.exp(-eta * (1.0 - tv))
+            expected = blend * kl + (1.0 - blend) * tv
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-7, rtol=1e-7))
+        actual.sum().backward()
+        self.assertIsNotNone(draft_logits.grad)
+        self.assertGreater(draft_logits.grad.abs().sum(), 0)
+        self.assertIsNone(target_logits.grad)
+
+    def test_hybrid_lk_eta_zero_is_forward_kl(self):
+        draft_logits = torch.tensor([[0.1, 0.9, -0.2]])
+        target_logits = torch.tensor([[1.0, -0.5, 0.3]])
+
+        actual = _hybrid_likelihood_overlap_loss(
+            draft_logits,
+            target_logits,
+            eta=0.0,
+        )
+        target_probs = torch.softmax(target_logits, dim=-1)
+        expected = (
+            target_probs
+            * (torch.log_softmax(target_logits, dim=-1) - torch.log_softmax(draft_logits, dim=-1))
+        ).sum(dim=-1)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-7, rtol=1e-7))
 
     def test_target_distribution_is_detached(self):
         draft_logits = torch.tensor([[0.3, -0.2, 1.1]], requires_grad=True)
@@ -711,6 +756,18 @@ class TestDFlashModelForward(unittest.TestCase):
                 ce_loss_alpha=0,
                 l1_loss_alpha=0.5,
             )
+
+    def test_hybrid_lk_requires_unblended_unary_objective_and_valid_eta(self):
+        with self.assertRaisesRegex(ValueError, "dflash_ce_loss_alpha=0"):
+            _make_dflash_model(loss_objective="hybrid_lk")
+        model = _make_dflash_model(
+            loss_objective="hybrid_lk",
+            ce_loss_alpha=0,
+            lk_eta=3.0,
+        )
+        self.assertTrue(model.uses_target_hidden_states)
+        with self.assertRaisesRegex(ValueError, "dflash_lk_eta"):
+            _make_dflash_model(lk_eta=float("nan"))
 
     def test_tv_requires_unblended_unary_objective(self):
         with self.assertRaisesRegex(ValueError, "dflash_ce_loss_alpha=0"):
@@ -1391,6 +1448,7 @@ class TestDFlashTrainingConfig(unittest.TestCase):
         self.assertEqual(config.dflash_num_anchors, 512)
         self.assertEqual(config.dflash_loss_objective, "decay")
         self.assertEqual(config.dflash_dpace_alpha, 0.5)
+        self.assertEqual(config.dflash_lk_eta, 3.0)
         self.assertEqual(config.dflash_loss_decay_gamma, 7.0)
         self.assertEqual(config.dflash_num_target_layers, 5)
 

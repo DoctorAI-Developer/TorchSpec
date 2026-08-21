@@ -26,6 +26,7 @@ and cross-entropy loss with exponential decay weighting.
 Matches SpecForge's OnlineDFlashModel (specforge/core/dflash.py).
 """
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -39,6 +40,7 @@ _VALID_DFLASH_LOSS_OBJECTIVES = {
     "auf",
     "decay",
     "dpace",
+    "hybrid_lk",
     "lk",
     "opd",
     "path",
@@ -85,6 +87,40 @@ def _total_variation_loss(
 ) -> torch.Tensor:
     """Directly maximize one-step acceptance via total variation distance."""
     return 1.0 - _distribution_overlap(draft_logits, target_logits)
+
+
+def _hybrid_likelihood_overlap_loss(
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    *,
+    eta: float = 3.0,
+) -> torch.Tensor:
+    """Return AngelSpec's per-token KL/TV likelihood-overlap surrogate.
+
+    With detached target distribution ``p`` and draft distribution ``q``, the
+    objective is ``lambda * KL(p || q) + (1 - lambda) * TV(p, q)`` where
+    ``lambda = exp(-eta * stop_gradient(1 - TV))``.  The detached schedule uses
+    the smoother KL gradient when overlap is poor and increasingly emphasizes
+    the acceptance-exact TV term as the draft approaches the target.
+    """
+    if draft_logits.shape != target_logits.shape:
+        raise ValueError(
+            "draft and target logits must have identical shapes, got "
+            f"{tuple(draft_logits.shape)} and {tuple(target_logits.shape)}"
+        )
+    eta = float(eta)
+    if not math.isfinite(eta) or eta < 0:
+        raise ValueError(f"dflash_lk_eta must be finite and non-negative, got {eta}")
+
+    with torch.no_grad():
+        target_probs = torch.softmax(target_logits.float(), dim=-1)
+    draft_log_probs = torch.log_softmax(draft_logits.float(), dim=-1)
+    draft_probs = draft_log_probs.exp()
+    tv = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
+    target_log_probs = target_probs.clamp_min(1e-9).log()
+    forward_kl = (target_probs * (target_log_probs - draft_log_probs)).sum(dim=-1)
+    blend = torch.exp(-eta * (1.0 - tv).detach().clamp(0.0, 1.0))
+    return blend * forward_kl + (1.0 - blend) * tv
 
 
 def _bernoulli_forward_kl_loss(
@@ -252,6 +288,7 @@ class DFlashModel(nn.Module):
         num_anchors: int = 512,
         loss_objective: str = "decay",
         dpace_alpha: float = 0.5,
+        lk_eta: float = 3.0,
         loss_decay_gamma: float = 7.0,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
@@ -275,6 +312,11 @@ class DFlashModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_objective = loss_objective
         self.dpace_alpha = dpace_alpha
+        self.lk_eta = float(lk_eta)
+        if not math.isfinite(self.lk_eta) or self.lk_eta < 0:
+            raise ValueError(
+                f"dflash_lk_eta must be finite and non-negative, got {self.lk_eta}"
+            )
         self.loss_decay_gamma = loss_decay_gamma
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
@@ -292,7 +334,7 @@ class DFlashModel(nn.Module):
             raise ValueError(
                 "opd_accepted_objective must be one of forward_kl, tv, or lk"
             )
-        if self.loss_objective in {"lk", "opd", "path", "tv"}:
+        if self.loss_objective in {"hybrid_lk", "lk", "opd", "path", "tv"}:
             objective_name = self.loss_objective.upper()
             if self.ce_loss_alpha != 0:
                 raise ValueError(
@@ -309,6 +351,7 @@ class DFlashModel(nn.Module):
     @property
     def uses_target_hidden_states(self) -> bool:
         return self.l1_loss_alpha > 0 or self.loss_objective in {
+            "hybrid_lk",
             "lk",
             "opd",
             "path",
@@ -514,7 +557,7 @@ class DFlashModel(nn.Module):
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
         distribution_loss = None
-        if self.loss_objective in {"lk", "opd", "path", "tv"}:
+        if self.loss_objective in {"hybrid_lk", "lk", "opd", "path", "tv"}:
             if aligned_target_hidden is None:
                 raise ValueError(
                     "DFlash distribution training requires aligned target hidden states"
@@ -541,6 +584,12 @@ class DFlashModel(nn.Module):
         KL; TV and likelihood-overlap are explicit experimental alternatives.
         """
 
+        if self.loss_objective == "hybrid_lk":
+            return _hybrid_likelihood_overlap_loss(
+                draft_logits,
+                target_logits,
+                eta=self.lk_eta,
+            )
         if self.loss_objective == "tv" or (
             self.loss_objective == "opd" and self.opd_accepted_objective == "tv"
         ):
@@ -876,7 +925,7 @@ class DFlashModel(nn.Module):
             if last_hidden_states is None:
                 requirement = (
                     f"DFlash {self.loss_objective.upper()}"
-                    if self.loss_objective in {"lk", "opd", "path", "tv"}
+                    if self.loss_objective in {"hybrid_lk", "lk", "opd", "path", "tv"}
                     else "DFlash L1 distillation (l1_loss_alpha > 0)"
                 )
                 raise ValueError(
@@ -929,7 +978,7 @@ class DFlashModel(nn.Module):
         # D-PACE-style expected-prefix value to LK below.
         flat_targets = target_ids.view(-1)
 
-        if self.loss_objective in {"lk", "opd", "path", "tv"}:
+        if self.loss_objective in {"hybrid_lk", "lk", "opd", "path", "tv"}:
             if distribution_loss is None:
                 raise RuntimeError(
                     "DFlash distribution token statistics did not return overlap loss"
@@ -960,7 +1009,7 @@ class DFlashModel(nn.Module):
             k = torch.arange(self.block_size, device=device).view(1, 1, -1)
             decay_weights = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
             objective_weights = weight_mask * decay_weights
-        elif self.loss_objective == "dpace":
+        elif self.loss_objective in {"dpace", "hybrid_lk"}:
             dpace_weights = torch.ones_like(weight_mask)
             if self.block_size > 1:
                 with torch.no_grad():

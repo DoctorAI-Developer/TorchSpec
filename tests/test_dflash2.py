@@ -1735,7 +1735,7 @@ class TestDFlash2Forward(unittest.TestCase):
                 )
 
     def test_chunked_distribution_losses_match_full_loss_and_gradients(self):
-        for objective in ("lk", "path", "tv"):
+        for objective in ("hybrid_lk", "lk", "path", "tv"):
             with self.subTest(objective=objective):
                 full_model = _make_model(
                     logits_chunk_size=0,
