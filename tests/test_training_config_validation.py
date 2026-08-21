@@ -81,6 +81,12 @@ def test_load_config_rejects_invalid_dflash2_selector_objective():
         load_config(base_config=base)
 
 
+def test_load_config_rejects_invalid_dflash2_trainable_scope():
+    base = _resolved_training_config(dflash2_trainable_scope="selector_and_head")
+    with pytest.raises(ValueError, match="dflash2_trainable_scope"):
+        load_config(base_config=base)
+
+
 def test_load_config_requires_sampling_selector_map_and_opd():
     missing_map = _resolved_training_config(
         dflash_loss_objective="opd",

@@ -1250,6 +1250,47 @@ class TestDFlash2Forward(unittest.TestCase):
 
 
 class TestDFlash2Export(unittest.TestCase):
+    def test_selector_only_scope_freezes_every_other_draft_parameter(self):
+        trainer_class = _load_dflash2_trainer()
+        trainer = trainer_class.__new__(trainer_class)
+        trainer.trainable_scope = "selector_only"
+        model = DFlash2DraftModel(_make_config())
+
+        trainer._configure_trainable_parameters(model)
+
+        trainable = {
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        }
+        self.assertTrue(trainable)
+        self.assertTrue(
+            all(name.startswith("candidate_selector.") for name in trainable),
+            trainable,
+        )
+        self.assertEqual(
+            trainable,
+            {
+                "candidate_selector.predecessor_codebook",
+                "candidate_selector.successor_codebook",
+                "candidate_selector.hidden_projection.weight",
+            },
+        )
+
+    def test_all_scope_preserves_existing_trainability(self):
+        trainer_class = _load_dflash2_trainer()
+        trainer = trainer_class.__new__(trainer_class)
+        trainer.trainable_scope = "all"
+        model = DFlash2DraftModel(_make_config())
+        before = {
+            name: parameter.requires_grad for name, parameter in model.named_parameters()
+        }
+
+        trainer._configure_trainable_parameters(model)
+
+        self.assertEqual(
+            before,
+            {name: parameter.requires_grad for name, parameter in model.named_parameters()},
+        )
+
     def test_config_exports_official_dflash2_schema(self):
         config = DFlash2Config(
             **{

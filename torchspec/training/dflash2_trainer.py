@@ -39,6 +39,7 @@ class DFlash2Trainer(DFlashTrainer):
         super().__init__(args)
         self.logits_chunk_size = getattr(args, "dflash2_logits_chunk_size", 0)
         self.selector_loss_alpha = getattr(args, "dflash2_selector_loss_alpha", 1.0)
+        self.trainable_scope = getattr(args, "dflash2_trainable_scope", "all")
         self.selector_objective = getattr(args, "dflash2_selector_objective", "teacher_ce")
         self.selector_token_map_path = getattr(
             args, "dflash2_selector_token_map_path", None
@@ -64,6 +65,18 @@ class DFlash2Trainer(DFlashTrainer):
         self.opd_accepted_objective = getattr(
             args, "dflash2_opd_accepted_objective", "forward_kl"
         )
+
+    def _configure_trainable_parameters(self, draft_model) -> None:
+        if self.trainable_scope == "all":
+            return
+        if self.trainable_scope != "selector_only":
+            raise ValueError(
+                "dflash2_trainable_scope must be one of all or selector_only"
+            )
+        for parameter in draft_model.parameters():
+            parameter.requires_grad = False
+        for parameter in draft_model.candidate_selector.parameters():
+            parameter.requires_grad = True
 
     def _build_draft_model(self, config):
         if config.block_size != self.block_size:

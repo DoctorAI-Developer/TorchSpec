@@ -69,6 +69,9 @@ class DFlashTrainer(Trainer):
             l1_loss_alpha=self.l1_loss_alpha,
         )
 
+    def _configure_trainable_parameters(self, draft_model) -> None:
+        """Apply trainer-specific parameter freezing before FSDP and optimizer init."""
+
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.target_lm_head: Optional[torch.nn.Module] = None
@@ -146,6 +149,7 @@ class DFlashTrainer(Trainer):
             )
 
         draft_model.freeze_embedding()
+        self._configure_trainable_parameters(draft_model)
         draft_model = draft_model.to(torch.bfloat16)
         # Enable gradient checkpointing from config (cuts backward activation
         # memory ~60-80%, which is required for colocated training on one GPU).
@@ -157,7 +161,7 @@ class DFlashTrainer(Trainer):
         trainable_count = sum(p.numel() for p in draft_model.parameters() if p.requires_grad)
         logger.info(
             f"[Rank {self.dp_rank}] DFlash draft model: {trainable_count:,} trainable, "
-            f"{frozen_count:,} frozen (embedding) parameters"
+            f"{frozen_count:,} frozen parameters"
         )
 
         dflash_model = self._build_training_wrapper(draft_model)

@@ -165,6 +165,10 @@ class TrainingConfig:
     # DFlash2-specific parameters (used by DFlash2 trainer only)
     dflash2_logits_chunk_size: int = 0
     dflash2_selector_loss_alpha: float = 1.0
+    # "all" preserves joint drafter training. "selector_only" freezes every
+    # draft parameter except the deployed candidate selector, so an experiment
+    # cannot silently change unary proposals or add serving-time work.
+    dflash2_trainable_scope: str = "all"
     # teacher_ce exactly preserves existing behavior. sampling_tv optimizes
     # one-step overlap on the deployed reduced-head/top-16 distribution;
     # sampling_path optimizes its differentiable accepted-prefix survival.
@@ -387,6 +391,10 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
             raise ValueError(
                 "dflash2_selector_token_map_sha256 must be 64 lowercase hex characters"
             )
+    if config.training.dflash2_trainable_scope not in {"all", "selector_only"}:
+        raise ValueError(
+            "dflash2_trainable_scope must be one of all or selector_only"
+        )
     if (
         not 0 < config.training.dflash2_selector_temperature
         or not math.isfinite(config.training.dflash2_selector_temperature)
