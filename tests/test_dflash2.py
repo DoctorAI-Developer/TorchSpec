@@ -44,7 +44,11 @@ from torchspec.models.dflash import (
     _dpace_position_weights,
     _total_variation_loss,
 )
-from torchspec.models.dflash2 import DFlash2Model, _tree_frontier_ranking_loss
+from torchspec.models.dflash2 import (
+    DFlash2Model,
+    _tree_frontier_ranking_loss,
+    _tree_reach_distillation_loss,
+)
 from torchspec.models.draft.auto import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.models.draft.dflash2 import (
@@ -155,6 +159,8 @@ def _make_model(
     selector_tree_depth_log_bias=0.0,
     selector_tree_margin=0.0,
     selector_tree_path_weight=0.25,
+    selector_taps_local_weight=1.0,
+    selector_taps_reach_weight=0.25,
 ):
     config = _make_config()
     draft = DFlash2DraftModel(config).to(dtype=torch.float32)
@@ -179,6 +185,8 @@ def _make_model(
         selector_tree_depth_log_bias=selector_tree_depth_log_bias,
         selector_tree_margin=selector_tree_margin,
         selector_tree_path_weight=selector_tree_path_weight,
+        selector_taps_local_weight=selector_taps_local_weight,
+        selector_taps_reach_weight=selector_taps_reach_weight,
         opd_rejected_k3_preserve_negative_tail=(opd_rejected_k3_preserve_negative_tail),
         opd_accepted_objective=opd_accepted_objective,
     )
@@ -842,6 +850,96 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue((tree_loss.grad > 0).all())
         self.assertTrue((overlap.grad < 0).all())
 
+    def test_tree_reach_distillation_pushes_gold_and_selected_negative_apart(self):
+        candidate_ids = torch.tensor([[[10, 11], [20, 21]]], dtype=torch.int64)
+        edge_scores = torch.tensor(
+            [[[[2.0, 0.0], [2.0, 0.0]], [[-4.0, 1.0], [0.0, 0.0]]]],
+            requires_grad=True,
+        )
+        target_ids = torch.tensor([[10, 20]], dtype=torch.int64)
+
+        local_loss, reach_loss = _tree_reach_distillation_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=2,
+            depth_log_bias=0.0,
+        )
+
+        self.assertEqual(tuple(local_loss.shape), (1, 2))
+        self.assertEqual(tuple(reach_loss.shape), (1, 2))
+        self.assertGreater(local_loss[0, 0].item(), 0.0)
+        self.assertGreater(local_loss[0, 1].item(), local_loss[0, 0].item())
+        self.assertGreater(reach_loss[0, 1].item(), local_loss[0, 1].item())
+        (local_loss + reach_loss).sum().backward()
+        self.assertLess(edge_scores.grad[0, 1, 0, 0].item(), 0.0)
+        self.assertGreater(edge_scores.grad[0, 1, 0, 1].item(), 0.0)
+
+    def test_tree_reach_distillation_ignores_frozen_support_miss(self):
+        candidate_ids = torch.tensor([[[10, 11], [20, 21]]], dtype=torch.int64)
+        edge_scores = torch.zeros(1, 2, 2, 2, requires_grad=True)
+        target_ids = torch.tensor([[99, 20]], dtype=torch.int64)
+
+        local_loss, reach_loss = _tree_reach_distillation_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=2,
+            depth_log_bias=-0.375,
+        )
+
+        self.assertEqual(local_loss.sum().item(), 0.0)
+        self.assertEqual(reach_loss.sum().item(), 0.0)
+
+    def test_sampling_taps_combines_local_and_reach_terms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            model = _make_model(
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_taps",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+                selector_verifier_temperature=0.0,
+                selector_verifier_top_k=1,
+                selector_verifier_top_p=1.0,
+                selector_tree_budget=4,
+                selector_taps_local_weight=1.0,
+                selector_taps_reach_weight=0.25,
+            )
+        local_loss = torch.tensor([[[0.2, 0.3, 0.4]]], requires_grad=True)
+        reach_loss = torch.tensor([[[0.5, 0.5, 0.5]]], requires_grad=True)
+        payload = torch.stack((local_loss, reach_loss), dim=-1)
+        weights = torch.tensor([[[0.0, 1.0, 1.0, 1.0]]])
+
+        extra_numerator, components = model._extra_training_loss(
+            torch.zeros(1, 4, 16),
+            payload,
+            torch.zeros(1, 1, 4, dtype=torch.long),
+            weights,
+            weights,
+        )
+
+        expected_unweighted = 0.9 + 0.25 * 1.5
+        self.assertTrue(
+            torch.allclose(
+                extra_numerator,
+                torch.tensor(model.selector_loss_alpha * expected_unweighted),
+            )
+        )
+        local_num, local_den = components["selector_taps_local_loss"]
+        reach_num, reach_den = components["selector_taps_reach_loss"]
+        self.assertTrue(torch.allclose(local_num, torch.tensor(0.9)))
+        self.assertTrue(torch.allclose(reach_num, torch.tensor(1.5)))
+        self.assertEqual(local_den.item(), 3.0)
+        self.assertEqual(reach_den.item(), 3.0)
+        extra_numerator.backward()
+        self.assertTrue((local_loss.grad > 0).all())
+        self.assertTrue((reach_loss.grad > 0).all())
+
     def test_sampling_tree_builds_the_same_markov_lattice_as_serving(self):
         config = _make_config(
             hidden_size=4,
@@ -900,6 +998,67 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue(torch.equal(captured_targets, targets[..., 1:].reshape(1, 2)))
         self.assertTrue(torch.allclose(captured_scores, expected_scores.reshape(1, 2, 2, 2)))
         self.assertEqual(frontier.call_args.kwargs["budget"], 2)
+
+    def test_sampling_taps_builds_the_same_markov_lattice_as_serving(self):
+        config = _make_config(
+            hidden_size=4,
+            vocab_size=6,
+            num_target_layers=1,
+            block_size=3,
+            selector_rank=2,
+            selector_top_k=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(6, dtype=torch.int64),
+            )
+            model = DFlash2Model(
+                DFlash2DraftModel(config),
+                block_size=3,
+                num_anchors=1,
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_taps",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+                selector_verifier_temperature=0.0,
+                selector_verifier_top_k=1,
+                selector_verifier_top_p=1.0,
+                selector_tree_budget=2,
+            )
+        selector = model.draft_model.candidate_selector
+        hidden = torch.randn(1, 1, 2, 4)
+        logits = torch.randn(1, 1, 2, 6)
+        targets = torch.tensor([[[5, 1, 2]]], dtype=torch.int64)
+
+        with mock.patch(
+            "torchspec.models.dflash2._tree_reach_distillation_loss",
+            return_value=(torch.zeros(1, 2), torch.ones(1, 2)),
+        ) as distill:
+            local_loss, reach_loss = model._selector_tree_taps_loss(hidden, logits, targets)
+
+        captured_candidates, captured_scores, captured_targets = distill.call_args.args
+        unary, local_ids = torch.topk(logits, 2, dim=-1, sorted=False)
+        expected_candidates = local_ids
+        projected = selector.hidden_projection(hidden)
+        predecessor_ids = torch.cat(
+            (targets[..., :1, None].expand(1, 1, 1, 2), expected_candidates[..., :-1, :]),
+            dim=-2,
+        )
+        predecessor = selector.predecessor_codebook[predecessor_ids] * projected.unsqueeze(-2)
+        successor = selector.successor_codebook[expected_candidates]
+        expected_scores = unary.unsqueeze(-2) + torch.einsum(
+            "...dpr,...dcr->...dpc", predecessor, successor
+        )
+
+        self.assertEqual(tuple(local_loss.shape), (1, 1, 2))
+        self.assertEqual(tuple(reach_loss.shape), (1, 1, 2))
+        self.assertTrue(torch.equal(captured_candidates, expected_candidates.reshape(1, 2, 2)))
+        self.assertTrue(torch.equal(captured_targets, targets[..., 1:].reshape(1, 2)))
+        self.assertTrue(torch.allclose(captured_scores, expected_scores.reshape(1, 2, 2, 2)))
+        self.assertEqual(distill.call_args.kwargs["budget"], 2)
+        self.assertEqual(distill.call_args.kwargs["depth_log_bias"], 0.0)
 
     def test_sampling_selector_chunked_statistics_match_full_gradients(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -983,6 +1142,65 @@ class TestDFlash2Forward(unittest.TestCase):
             chunked_model = _make_model(logits_chunk_size=4, **common)
         chunked_model.load_state_dict(full_model.state_dict())
         generator = torch.Generator().manual_seed(223)
+        full_hidden = torch.randn(2, 8, 16, generator=generator, requires_grad=True)
+        chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
+        target_hidden = torch.randn(2, 8, 16, generator=generator)
+        target_ids = torch.randint(0, 16, (2, 2, 4), generator=generator)
+        full_head = torch.randn(32, 16, generator=generator, requires_grad=True)
+        chunked_head = full_head.detach().clone().requires_grad_(True)
+
+        full_result = full_model._compute_token_statistics(
+            full_hidden, full_head, target_ids, target_hidden
+        )
+        chunked_result = chunked_model._compute_token_statistics(
+            chunked_hidden, chunked_head, target_ids, target_hidden
+        )
+
+        for full_value, chunked_value in zip(full_result, chunked_result, strict=True):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        (full_result[0].sum() + full_result[2].sum() + full_result[3].sum()).backward()
+        (chunked_result[0].sum() + chunked_result[2].sum() + chunked_result[3].sum()).backward()
+        self.assertTrue(torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5))
+        chunked_parameters = dict(chunked_model.named_parameters())
+        for name, full_parameter in full_model.named_parameters():
+            chunked_parameter = chunked_parameters[name]
+            if full_parameter.grad is None:
+                self.assertIsNone(chunked_parameter.grad, msg=name)
+            else:
+                self.assertTrue(
+                    torch.allclose(
+                        full_parameter.grad,
+                        chunked_parameter.grad,
+                        atol=1e-5,
+                        rtol=1e-5,
+                    ),
+                    msg=name,
+                )
+
+    def test_sampling_taps_chunked_statistics_match_full_gradients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            common = {
+                "loss_objective": "opd",
+                "ce_loss_alpha": 0,
+                "opd_accepted_objective": "tv",
+                "selector_objective": "sampling_taps",
+                "selector_token_map_path": map_path,
+                "selector_token_map_sha256": map_sha256,
+                "selector_verifier_temperature": 0.0,
+                "selector_verifier_top_k": 1,
+                "selector_verifier_top_p": 1.0,
+                "selector_tree_budget": 4,
+                "selector_tree_depth_log_bias": -0.375,
+            }
+            full_model = _make_model(logits_chunk_size=0, **common)
+            chunked_model = _make_model(logits_chunk_size=4, **common)
+        chunked_model.load_state_dict(full_model.state_dict())
+        generator = torch.Generator().manual_seed(227)
         full_hidden = torch.randn(2, 8, 16, generator=generator, requires_grad=True)
         chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
         target_hidden = torch.randn(2, 8, 16, generator=generator)

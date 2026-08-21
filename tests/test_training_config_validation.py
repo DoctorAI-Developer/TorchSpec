@@ -115,12 +115,40 @@ def test_load_config_requires_explicit_sampling_tree_budget():
         load_config(base_config=base)
 
 
+def test_load_config_requires_explicit_sampling_taps_budget_and_greedy_target():
+    missing_budget = _resolved_training_config(
+        dflash_loss_objective="opd",
+        dflash_ce_loss_alpha=0,
+        dflash2_selector_objective="sampling_taps",
+        dflash2_selector_token_map_path="/tmp/map.pt",
+        dflash2_selector_token_map_sha256="0" * 64,
+        dflash2_selector_verifier_temperature=0.0,
+        dflash2_selector_verifier_top_k=1,
+        dflash2_selector_verifier_top_p=1.0,
+    )
+    with pytest.raises(ValueError, match="positive dflash2_selector_tree_budget"):
+        load_config(base_config=missing_budget)
+
+    non_greedy = _resolved_training_config(
+        dflash_loss_objective="opd",
+        dflash_ce_loss_alpha=0,
+        dflash2_selector_objective="sampling_taps",
+        dflash2_selector_token_map_path="/tmp/map.pt",
+        dflash2_selector_token_map_sha256="0" * 64,
+        dflash2_selector_tree_budget=12,
+    )
+    with pytest.raises(ValueError, match="requires greedy target verification"):
+        load_config(base_config=non_greedy)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
         ("dflash2_selector_tree_depth_log_bias", float("nan"), "depth_log_bias"),
         ("dflash2_selector_tree_margin", -0.1, "tree_margin"),
         ("dflash2_selector_tree_path_weight", -0.1, "tree_path_weight"),
+        ("dflash2_selector_taps_local_weight", -0.1, "taps_local_weight"),
+        ("dflash2_selector_taps_reach_weight", float("nan"), "taps_reach_weight"),
     ),
 )
 def test_load_config_rejects_invalid_selector_tree_values(field, value, message):

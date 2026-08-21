@@ -32,6 +32,8 @@ class DFlash2Trainer(DFlashTrainer):
     _extra_loss_component_keys = [
         "selector_loss",
         "selector_overlap",
+        "selector_taps_local_loss",
+        "selector_taps_reach_loss",
         "selector_tree_loss",
         "opd_rejected_loss",
     ]
@@ -56,6 +58,8 @@ class DFlash2Trainer(DFlashTrainer):
         )
         self.selector_tree_margin = getattr(args, "dflash2_selector_tree_margin", 0.0)
         self.selector_tree_path_weight = getattr(args, "dflash2_selector_tree_path_weight", 0.25)
+        self.selector_taps_local_weight = getattr(args, "dflash2_selector_taps_local_weight", 1.0)
+        self.selector_taps_reach_weight = getattr(args, "dflash2_selector_taps_reach_weight", 0.25)
         self.opd_rejected_stream_weight = getattr(args, "dflash2_opd_rejected_stream_weight", 1.0)
         self.opd_rejected_position_decay = getattr(args, "dflash2_opd_rejected_position_decay", 0.8)
         self.opd_rejected_k3_preserve_negative_tail = getattr(
@@ -110,6 +114,8 @@ class DFlash2Trainer(DFlashTrainer):
             selector_tree_depth_log_bias=self.selector_tree_depth_log_bias,
             selector_tree_margin=self.selector_tree_margin,
             selector_tree_path_weight=self.selector_tree_path_weight,
+            selector_taps_local_weight=self.selector_taps_local_weight,
+            selector_taps_reach_weight=self.selector_taps_reach_weight,
             opd_rejected_stream_weight=self.opd_rejected_stream_weight,
             opd_rejected_position_decay=self.opd_rejected_position_decay,
             opd_rejected_k3_preserve_negative_tail=(self.opd_rejected_k3_preserve_negative_tail),

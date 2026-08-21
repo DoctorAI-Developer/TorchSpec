@@ -33,6 +33,7 @@ from torchspec.models.dflash import DFlashModel
 _VALID_SELECTOR_OBJECTIVES = {
     "teacher_ce",
     "sampling_path",
+    "sampling_taps",
     "sampling_tree",
     "sampling_tv",
 }
@@ -191,6 +192,181 @@ def _tree_frontier_ranking_loss(
     )
 
 
+def _tree_reach_distillation_loss(
+    candidate_ids: torch.Tensor,
+    edge_scores: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    budget: int,
+    depth_log_bias: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Distill local target preference and bounded-tree prefix reach.
+
+    TAPS separates the probability of choosing the target child at a reached
+    parent from the probability that the complete prefix reaches a node. This
+    helper applies the same decomposition to DFlash2's deployed Markov lattice.
+    The positive reach term covers every available target-prefix node. The
+    negative term covers off-path nodes that the exact serving allocator spends
+    its bounded verification budget on. Allocation choices are stop-gradient;
+    the selected cumulative log probabilities retain gradients.
+
+    The target trajectory is greedy and therefore supplies a one-hot local
+    target distribution. If the target token is absent from a position's
+    candidate support, that position and all later positions are excluded: the
+    selector cannot repair a frozen unary-support miss.
+    """
+    if candidate_ids.ndim != 3:
+        raise ValueError("candidate_ids must have shape [batch, depth, top_k]")
+    batch, depth_limit, top_k = map(int, candidate_ids.shape)
+    if edge_scores.shape != (batch, depth_limit, top_k, top_k):
+        raise ValueError("candidate IDs and edge scores have incompatible shapes")
+    if target_ids.shape != (batch, depth_limit):
+        raise ValueError("target_ids must have shape [batch, depth]")
+    if candidate_ids.dtype != torch.int64 or target_ids.dtype != torch.int64:
+        raise ValueError("candidate_ids and target_ids must use torch.int64")
+    if budget <= 0 or budget > depth_limit * top_k:
+        raise ValueError("tree budget must be in [1, depth * top_k]")
+    if not math.isfinite(depth_log_bias):
+        raise ValueError("tree depth log bias must be finite")
+    if batch == 0:
+        empty = edge_scores.new_zeros((0, depth_limit), dtype=torch.float32)
+        return empty, empty
+
+    log_probs = torch.log_softmax(edge_scores.float(), dim=-1)
+    matches = candidate_ids.eq(target_ids.unsqueeze(-1))
+    gold_present = matches.any(dim=-1)
+    gold_children = matches.to(torch.int64).argmax(dim=-1)
+    gold_available = gold_present.to(torch.int64).cumprod(dim=-1).bool()
+
+    device = edge_scores.device
+    batch_index = torch.arange(batch, device=device)
+    depth_index = torch.arange(depth_limit, device=device)
+
+    # Local one-hot target KL (constant target-entropy term omitted) and the
+    # positive BCE part for cumulative prefix reach.
+    gold_parents = torch.zeros((batch, depth_limit), dtype=torch.int64, device=device)
+    if depth_limit > 1:
+        gold_parents[:, 1:] = gold_children[:, :-1]
+    gold_edge_log_probs = log_probs[
+        batch_index[:, None],
+        depth_index[None, :],
+        gold_parents,
+        gold_children,
+    ]
+    safe_gold_edges = torch.where(
+        gold_available,
+        gold_edge_log_probs,
+        torch.zeros_like(gold_edge_log_probs),
+    )
+    local_loss = torch.where(gold_available, -gold_edge_log_probs, 0.0)
+    positive_reach_loss = torch.where(
+        gold_available,
+        -torch.cumsum(safe_gold_edges, dim=-1),
+        0.0,
+    )
+
+    selected_parent: list[torch.Tensor] = []
+    selected_depth: list[torch.Tensor] = []
+    selected_child: list[torch.Tensor] = []
+    selected_cumulative: list[torch.Tensor] = []
+    selected_is_gold: list[torch.Tensor] = []
+    negative_terms: list[torch.Tensor] = []
+    negative_depths: list[torch.Tensor] = []
+
+    for iteration in range(budget):
+        parent_slots = iteration + 1
+        parent_index = torch.arange(parent_slots, device=device, dtype=torch.int64)
+        if iteration == 0:
+            next_depth = torch.zeros((batch, 1), dtype=torch.int64, device=device)
+            predecessor = torch.zeros_like(next_depth)
+            parent_cumulative = edge_scores.new_zeros((batch, 1), dtype=torch.float32)
+            parent_is_gold = torch.ones((batch, 1), dtype=torch.bool, device=device)
+        else:
+            next_depth = torch.stack([torch.zeros_like(selected_depth[0]), *selected_depth], dim=1)
+            predecessor = torch.stack([torch.zeros_like(selected_child[0]), *selected_child], dim=1)
+            parent_cumulative = torch.stack(
+                [torch.zeros_like(selected_cumulative[0]), *selected_cumulative],
+                dim=1,
+            )
+            parent_is_gold = torch.stack(
+                [torch.ones_like(selected_is_gold[0]), *selected_is_gold],
+                dim=1,
+            )
+
+        valid_parent = next_depth < depth_limit
+        safe_depth = next_depth.clamp_max(depth_limit - 1)
+        score_rows = log_probs[batch_index[:, None], safe_depth, predecessor]
+        raw_cumulative = parent_cumulative.unsqueeze(-1) + score_rows
+        selection_scores = (
+            raw_cumulative + (safe_depth.to(torch.float32).unsqueeze(-1) + 1.0) * depth_log_bias
+        )
+
+        valid = valid_parent.unsqueeze(-1).expand(-1, -1, top_k).clone()
+        child_grid = torch.arange(top_k, device=device, dtype=torch.int64).view(1, 1, -1)
+        parent_grid = parent_index.view(1, -1, 1)
+        for old_parent, old_child in zip(selected_parent, selected_child, strict=True):
+            valid &= ~(
+                parent_grid.eq(old_parent[:, None, None]) & child_grid.eq(old_child[:, None, None])
+            )
+
+        detached_scores = selection_scores.detach().masked_fill(~valid, -torch.inf)
+        best = detached_scores.amax(dim=(1, 2), keepdim=True)
+        tied = valid & detached_scores.eq(best)
+        sentinel = torch.iinfo(torch.int64).max
+
+        depth_key = safe_depth.unsqueeze(-1).expand(-1, -1, top_k)
+        best_depth = torch.where(tied, depth_key, sentinel).amin(dim=(1, 2), keepdim=True)
+        tied &= depth_key.eq(best_depth)
+
+        expanded_parent = parent_grid.expand(batch, -1, top_k)
+        best_parent = torch.where(tied, expanded_parent, sentinel).amin(dim=(1, 2), keepdim=True)
+        tied &= expanded_parent.eq(best_parent)
+
+        token_rows = candidate_ids[batch_index[:, None], safe_depth]
+        best_token = torch.where(tied, token_rows, sentinel).amin(dim=(1, 2), keepdim=True)
+        tied &= token_rows.eq(best_token)
+
+        expanded_child = child_grid.expand(batch, parent_slots, -1)
+        best_child = torch.where(tied, expanded_child, sentinel).amin(dim=(1, 2), keepdim=True)
+        tied &= expanded_child.eq(best_child)
+        flat_choices = torch.where(
+            tied.reshape(batch, -1),
+            torch.arange(parent_slots * top_k, device=device, dtype=torch.int64),
+            sentinel,
+        ).amin(dim=1)
+        chosen_parent = flat_choices // top_k
+        chosen_child = flat_choices % top_k
+        chosen_depth = next_depth[batch_index, chosen_parent]
+        chosen_raw = raw_cumulative[batch_index, chosen_parent, chosen_child]
+        chosen_token = candidate_ids[batch_index, chosen_depth, chosen_child]
+        chosen_is_gold = (
+            parent_is_gold[batch_index, chosen_parent]
+            & gold_available[batch_index, chosen_depth]
+            & chosen_token.eq(target_ids[batch_index, chosen_depth])
+        )
+
+        # Stable -log(1 - q_reach) for selected off-path nodes. Clamp only the
+        # mathematically singular q=1 endpoint; ordinary log probabilities and
+        # their gradients are unchanged.
+        max_log_reach = chosen_raw.new_tensor(-torch.finfo(chosen_raw.dtype).eps)
+        safe_negative_log_reach = torch.minimum(chosen_raw, max_log_reach)
+        negative_bce = -torch.log(-torch.expm1(safe_negative_log_reach))
+        negative_valid = gold_available[batch_index, chosen_depth] & ~chosen_is_gold
+        negative_terms.append(torch.where(negative_valid, negative_bce, 0.0))
+        negative_depths.append(chosen_depth)
+
+        selected_parent.append(chosen_parent)
+        selected_depth.append(chosen_depth + 1)
+        selected_child.append(chosen_child)
+        selected_cumulative.append(chosen_raw)
+        selected_is_gold.append(chosen_is_gold)
+
+    negative_loss = torch.stack(negative_terms, dim=1) / float(budget)
+    negative_depth = torch.stack(negative_depths, dim=1)
+    reach_loss = positive_reach_loss.scatter_add(1, negative_depth, negative_loss)
+    return local_loss, reach_loss
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -283,6 +459,8 @@ class DFlash2Model(DFlashModel):
         selector_tree_depth_log_bias: float = 0.0,
         selector_tree_margin: float = 0.0,
         selector_tree_path_weight: float = 0.25,
+        selector_taps_local_weight: float = 1.0,
+        selector_taps_reach_weight: float = 0.25,
         logits_chunk_size: int = 0,
         **kwargs,
     ):
@@ -313,6 +491,8 @@ class DFlash2Model(DFlashModel):
         self.selector_tree_depth_log_bias = float(selector_tree_depth_log_bias)
         self.selector_tree_margin = float(selector_tree_margin)
         self.selector_tree_path_weight = float(selector_tree_path_weight)
+        self.selector_taps_local_weight = float(selector_taps_local_weight)
+        self.selector_taps_reach_weight = float(selector_taps_reach_weight)
         if not math.isfinite(self.selector_temperature) or self.selector_temperature <= 0:
             raise ValueError("dflash2_selector_temperature must be finite and positive")
         if (
@@ -327,11 +507,11 @@ class DFlash2Model(DFlashModel):
             or not 0 < self.selector_verifier_top_p <= 1
         ):
             raise ValueError("dflash2_selector_verifier_top_p must be in (0, 1]")
-        if self.selector_objective == "sampling_tree":
+        if self.selector_objective in {"sampling_taps", "sampling_tree"}:
             max_tree_budget = (self.block_size - 1) * int(config.selector_top_k)
             if not 1 <= self.selector_tree_budget <= max_tree_budget:
                 raise ValueError(
-                    "sampling_tree budget must be in "
+                    "bounded-tree selector budget must be in "
                     f"[1, {max_tree_budget}], got {self.selector_tree_budget}"
                 )
         if not math.isfinite(self.selector_tree_depth_log_bias):
@@ -340,6 +520,26 @@ class DFlash2Model(DFlashModel):
             raise ValueError("dflash2_selector_tree_margin must be finite and non-negative")
         if self.selector_tree_path_weight < 0 or not math.isfinite(self.selector_tree_path_weight):
             raise ValueError("dflash2_selector_tree_path_weight must be finite and non-negative")
+        if self.selector_taps_local_weight < 0 or not math.isfinite(
+            self.selector_taps_local_weight
+        ):
+            raise ValueError("dflash2_selector_taps_local_weight must be finite and non-negative")
+        if self.selector_taps_reach_weight < 0 or not math.isfinite(
+            self.selector_taps_reach_weight
+        ):
+            raise ValueError("dflash2_selector_taps_reach_weight must be finite and non-negative")
+        if self.selector_objective == "sampling_taps":
+            if self.selector_taps_local_weight == self.selector_taps_reach_weight == 0:
+                raise ValueError("sampling_taps requires a positive local or reach weight")
+            if not (
+                self.selector_verifier_temperature == 0.0
+                and self.selector_verifier_top_k == 1
+                and self.selector_verifier_top_p == 1.0
+            ):
+                raise ValueError(
+                    "sampling_taps currently requires greedy target verification "
+                    "(temperature=0, top_k=1, top_p=1)"
+                )
 
         sampling_selector = self.selector_objective != "teacher_ce"
         if sampling_selector and self.loss_objective != "opd":
@@ -534,6 +734,62 @@ class DFlash2Model(DFlashModel):
             margin=self.selector_tree_margin,
         ).reshape(*target_ids.shape[:-1], depth_limit)
 
+    def _selector_tree_taps_loss(
+        self,
+        hidden_states: torch.Tensor,
+        draft_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the serving lattice and distill local and reach probabilities."""
+        if hidden_states.shape[:-1] != draft_logits.shape[:-1]:
+            raise ValueError("DFlash2 selector tree hidden/logit rows must match")
+        if target_ids.shape != (*hidden_states.shape[:-2], hidden_states.shape[-2] + 1):
+            raise ValueError("DFlash2 selector tree targets must include one anchor token")
+        if draft_logits.shape[-1] != self.draft_model.config.vocab_size:
+            raise ValueError("DFlash2 selector tree requires full-vocabulary draft logits")
+        if self.selector_token_ids.numel() == 0:
+            raise RuntimeError("DFlash2 selector tree token map is empty")
+
+        reduced_logits = torch.index_select(draft_logits, -1, self.selector_token_ids)
+        unary_logits, local_ids = torch.topk(
+            reduced_logits,
+            int(self.draft_model.candidate_selector.top_k),
+            dim=-1,
+            sorted=False,
+        )
+        candidate_ids = self.selector_token_ids[local_ids]
+        selector = self.draft_model.candidate_selector
+        projected_hidden = selector.hidden_projection(hidden_states)
+        top_k = int(selector.top_k)
+        predecessor_ids = torch.cat(
+            (
+                target_ids[..., :1, None].expand(*target_ids.shape[:-1], 1, top_k),
+                candidate_ids[..., :-1, :],
+            ),
+            dim=-2,
+        )
+        predecessor = selector.predecessor_codebook[predecessor_ids] * projected_hidden.unsqueeze(
+            -2
+        )
+        successor = selector.successor_codebook[candidate_ids]
+        edge_scores = unary_logits.unsqueeze(-2) + torch.einsum(
+            "...dpr,...dcr->...dpc", predecessor, successor
+        )
+
+        depth_limit = int(candidate_ids.shape[-2])
+        flat_candidates = candidate_ids.reshape(-1, depth_limit, top_k)
+        flat_scores = edge_scores.reshape(-1, depth_limit, top_k, top_k)
+        flat_targets = target_ids[..., 1:].reshape(-1, depth_limit)
+        local_loss, reach_loss = _tree_reach_distillation_loss(
+            flat_candidates,
+            flat_scores,
+            flat_targets,
+            budget=self.selector_tree_budget,
+            depth_log_bias=self.selector_tree_depth_log_bias,
+        )
+        output_shape = (*target_ids.shape[:-1], depth_limit)
+        return local_loss.reshape(output_shape), reach_loss.reshape(output_shape)
+
     def _compute_token_statistics(
         self,
         draft_hidden: torch.Tensor,
@@ -625,6 +881,13 @@ class DFlash2Model(DFlashModel):
                     targets,
                 )
                 selector_payload = torch.stack((tree_loss, selector_overlap), dim=-1)
+            elif self.selector_objective == "sampling_taps":
+                local_loss, reach_loss = self._selector_tree_taps_loss(
+                    hidden[..., 1:, :],
+                    chunk_logits[..., 1:, :],
+                    targets,
+                )
+                selector_payload = torch.stack((local_loss, reach_loss), dim=-1)
             else:
                 selector_overlap = self._selector_sampling_overlap(
                     hidden[..., 1:, :],
@@ -717,16 +980,24 @@ class DFlash2Model(DFlashModel):
         selector_weights = native_weights if self.loss_objective == "auf" else objective_weights
         eligible_weights = selector_weights[..., 1:]
         eligible_weights = eligible_weights * (eligible_weights > 0).cumprod(dim=-1)
-        if self.selector_objective == "sampling_tree":
+        if self.selector_objective in {"sampling_taps", "sampling_tree"}:
             expected_shape = (*eligible_weights.shape, 2)
             if logits.shape != expected_shape:
                 raise RuntimeError(
-                    "sampling-tree DFlash2 selector objective requires compact "
-                    f"[tree_loss, overlap] statistics, got {tuple(logits.shape)} "
+                    "bounded-tree DFlash2 selector objective requires compact "
+                    f"two-component statistics, got {tuple(logits.shape)} "
                     f"instead of {expected_shape}"
                 )
-            tree_loss = logits[..., 0]
-            selector_payload = logits[..., 1]
+            if self.selector_objective == "sampling_tree":
+                tree_loss = logits[..., 0]
+                selector_payload = logits[..., 1]
+            else:
+                taps_local_loss = logits[..., 0]
+                taps_reach_loss = logits[..., 1]
+                selector_payload = (
+                    self.selector_taps_local_weight * taps_local_loss
+                    + self.selector_taps_reach_weight * taps_reach_loss
+                )
         elif logits.shape != eligible_weights.shape:
             if self.selector_objective != "teacher_ce":
                 raise RuntimeError(
@@ -773,6 +1044,19 @@ class DFlash2Model(DFlashModel):
             overlap_num = (overlap * eligible_weights).sum()
             overlap_den = eligible_weights.sum().detach()
             loss_components["selector_overlap"] = (overlap_num.detach(), overlap_den)
+        elif self.selector_objective == "sampling_taps":
+            selector_loss = selector_payload
+            local_num = (taps_local_loss * eligible_weights).sum()
+            reach_num = (taps_reach_loss * eligible_weights).sum()
+            component_den = eligible_weights.sum().detach()
+            loss_components["selector_taps_local_loss"] = (
+                local_num.detach(),
+                component_den,
+            )
+            loss_components["selector_taps_reach_loss"] = (
+                reach_num.detach(),
+                component_den,
+            )
         elif self.selector_objective == "sampling_tv":
             selector_loss = selector_payload
             overlap_num = ((1.0 - selector_payload) * eligible_weights).sum()
