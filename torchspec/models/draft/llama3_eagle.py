@@ -33,6 +33,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 from torchspec.config.utils import resolve_rope_theta
 from torchspec.models.draft.base import Eagle3DraftModel
+from torchspec.models.draft.cutlass_cache import require_cutlass_module_hash
 from torchspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
     eagle3_block_mask,
@@ -183,6 +184,13 @@ try:
                 *args,
                 **kwargs,
             ):
+                # flash-attn intentionally invokes CUTLASS with no_cache=True,
+                # so its caller is allowed to omit the hash. This wrapper
+                # changes that call to cached mode and must therefore compute
+                # the key before BaseDSL enforces its non-None invariant.
+                module_hash = require_cutlass_module_hash(
+                    self, module, module_hash, function_name
+                )
                 return _orig_compile_and_cache(
                     self,
                     module,
