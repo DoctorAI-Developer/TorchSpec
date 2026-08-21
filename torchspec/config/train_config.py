@@ -127,6 +127,12 @@ class TrainingConfig:
     max_grad_norm: float = 0.5
     max_seq_length: int = 8192
     min_lr: float = 0.0
+    optimizer: str = "adamw"
+    muon_learning_rate: Optional[float] = None
+    muon_momentum: float = 0.95
+    muon_weight_decay: float = 0.1
+    muon_ns_steps: int = 5
+    muon_adjust_lr_fn: Optional[str] = "match_rms_adamw"
     weight_decay: float = 0.0
     num_epochs: int = 10
     num_train_steps: Optional[int] = None
@@ -374,6 +380,18 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
             f"max_grad_norm must be > 0 (got {config.training.max_grad_norm}); "
             f"0 zeroes all grads (silent flat loss), <0 sign-flips grads (silent gradient ascent)"
         )
+    if config.training.optimizer not in {"adamw", "muon"}:
+        raise ValueError("optimizer must be one of adamw or muon")
+    if config.training.muon_learning_rate is not None and config.training.muon_learning_rate <= 0:
+        raise ValueError("muon_learning_rate must be positive when provided")
+    if not 0 <= config.training.muon_momentum < 1:
+        raise ValueError("muon_momentum must be in [0, 1)")
+    if config.training.muon_weight_decay < 0:
+        raise ValueError("muon_weight_decay must be non-negative")
+    if config.training.muon_ns_steps <= 0:
+        raise ValueError("muon_ns_steps must be positive")
+    if config.training.muon_adjust_lr_fn not in {None, "match_rms_adamw"}:
+        raise ValueError("muon_adjust_lr_fn must be null or match_rms_adamw")
     if config.training.dflash2_logits_chunk_size < 0:
         raise ValueError(
             "dflash2_logits_chunk_size must be >= 0 "

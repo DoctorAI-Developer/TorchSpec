@@ -196,6 +196,20 @@ class DFlashTrainer(Trainer):
         total_steps = self.args.lr_total_steps
         decay_style = getattr(self.args, "lr_decay_style", "cosine")
         warmup_ratio = getattr(self.args, "warmup_ratio", 0.1)
+        wsd_decay_steps = None
+        wsd_decay_style = None
+        if decay_style == "WSD" and total_steps:
+            wsd_ratio = getattr(
+                self.args,
+                "lr_wsd_decay_ratio",
+                getattr(self.args, "wsd_decay_ratio", 0.2),
+            )
+            wsd_decay_steps = int(wsd_ratio * total_steps)
+            wsd_decay_style = getattr(
+                self.args,
+                "lr_wsd_decay_style",
+                getattr(self.args, "wsd_decay_style", "cosine"),
+            )
 
         self.optimizer = BF16Optimizer(
             self.draft_model,
@@ -204,23 +218,26 @@ class DFlashTrainer(Trainer):
             max_grad_norm=self.args.max_grad_norm,
             warmup_ratio=warmup_ratio,
             total_steps=total_steps,
-            decay_style=decay_style if decay_style != "WSD" else "cosine",
+            decay_style=decay_style,
             min_lr=getattr(self.args, "min_lr", 0.0),
+            wsd_decay_steps=wsd_decay_steps,
+            wsd_decay_style=wsd_decay_style,
+            optimizer_type=getattr(self.args, "optimizer", "adamw"),
+            muon_lr=getattr(self.args, "muon_learning_rate", None),
+            muon_momentum=getattr(self.args, "muon_momentum", 0.95),
+            muon_weight_decay=getattr(self.args, "muon_weight_decay", 0.1),
+            muon_ns_steps=getattr(self.args, "muon_ns_steps", 5),
+            muon_adjust_lr_fn=getattr(self.args, "muon_adjust_lr_fn", "match_rms_adamw"),
         )
-
-        if decay_style == "WSD" and total_steps:
-            from torchspec.training.lr_scheduler import LRSchedulerWithWarmup
-
-            wsd_ratio = getattr(self.args, "wsd_decay_ratio", 0.2)
-            self.optimizer.scheduler = LRSchedulerWithWarmup(
-                self.optimizer.optimizer,
-                max_lr=self.args.learning_rate,
-                total_steps=total_steps,
-                warmup_steps=int(warmup_ratio * total_steps),
-                decay_style="WSD",
-                min_lr=getattr(self.args, "min_lr", 0.0),
-                wsd_decay_steps=int(wsd_ratio * total_steps),
-                wsd_decay_style=getattr(self.args, "wsd_decay_style", "cosine"),
+        if getattr(self.optimizer, "optimizer_type", None) == "muon":
+            logger.info(
+                "[Rank %s] Muon partition: %s parameters across %s matrices; "
+                "AdamW partition: %s parameters across %s tensors",
+                self.dp_rank,
+                f"{self.optimizer.muon_parameter_count:,}",
+                len(self.optimizer.muon_parameter_names),
+                f"{self.optimizer.adamw_parameter_count:,}",
+                len(self.optimizer.adamw_parameter_names),
             )
 
         self.lr_scheduler = self.optimizer.lr_scheduler
@@ -680,6 +697,9 @@ class DFlashTrainer(Trainer):
             "train/lr": self.optimizer.get_learning_rate(),
             "train/step": step,
         }
+        if hasattr(self.optimizer, "get_optimizer_learning_rates"):
+            for name, learning_rate in self.optimizer.get_optimizer_learning_rates().items():
+                metrics[f"train/{name}_lr"] = learning_rate
 
         for i in range(pred_loss_pp.shape[0]):
             metrics[f"train/ploss_{i}"] = pred_loss_pp[i].item()

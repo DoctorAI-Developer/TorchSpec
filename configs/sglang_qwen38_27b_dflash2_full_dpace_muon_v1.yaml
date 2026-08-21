@@ -1,0 +1,104 @@
+model:
+  target_model_path: ${oc.env:QWEN38_TARGET_MODEL,/home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B-FP8/snapshots/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a}
+  trust_remote_code: true
+  target_model_backend: hf
+  draft_model_config: ${oc.env:QWEN38_INITIAL_DRAFT,/home/ubuntu/qwen38-results/drafts/qwen38-dflash2-selector-only-path-v1-lr1e-5-step10}
+  initial_draft_model_path: ${oc.env:QWEN38_INITIAL_DRAFT,/home/ubuntu/qwen38-results/drafts/qwen38-dflash2-selector-only-path-v1-lr1e-5-step10}
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+
+dataset:
+  train_data_path: ""
+  eval_data_path: null
+  min_loss_tokens: 16
+  shuffle_dataset: true
+
+training:
+  attention_backend: flex_attention
+  colocate: false
+  micro_batch_size: 1
+  gradient_checkpointing: true
+  draft_accumulation_steps: 2
+  # Conservative fine-tuning rates for the released DFlash2 checkpoint. The
+  # larger 6e-4/3e-3 AdamW/Muon rates reported for training DFlash from scratch
+  # are an experiment arm, not a safe default for this initialized draft.
+  learning_rate: ${oc.env:QWEN38_ADAMW_LR,1e-5}
+  muon_learning_rate: ${oc.env:QWEN38_MUON_LR,5e-5}
+  optimizer: muon
+  muon_momentum: 0.95
+  muon_weight_decay: 0.1
+  muon_ns_steps: 5
+  muon_adjust_lr_fn: match_rms_adamw
+  min_lr: ${oc.env:QWEN38_MIN_LR,1e-6}
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 8192
+  # This checked-in arm is a short learning-rate screen on the existing
+  # development corpus. Final training requires the separately tracked,
+  # leakage-safe regenerated corpus and an uninterrupted multi-epoch schedule.
+  num_epochs: 1
+  num_train_steps: ${oc.env:QWEN38_TRAIN_STEPS,20}
+  # Keep the schedule horizon fixed while screening short runs so every arm
+  # receives the same early-training learning-rate trajectory.
+  lr_total_steps: ${oc.env:QWEN38_LR_TOTAL_STEPS,400}
+  lr_decay_style: cosine
+  seed: 20260821
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  fsdp_strategy: REPLICATE
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 1
+  save_interval: ${oc.env:QWEN38_SAVE_INTERVAL,5}
+  save_per_epoch: true
+  max_checkpoints: 4
+  warmup_ratio: 0.04
+  dflash_block_size: 8
+  dflash_num_anchors: ${oc.env:QWEN38_NUM_ANCHORS,256}
+  dflash_num_target_layers: 5
+  dflash_loss_objective: dpace
+  dflash_dpace_alpha: 0.5
+  dflash_ce_loss_alpha: 1.0
+  dflash_l1_loss_alpha: 0.0
+  dflash2_logits_chunk_size: 32
+  dflash2_trainable_scope: all
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_objective: teacher_ce
+
+inference:
+  inference_engine_type: offline
+  store_last_hidden_states: true
+  inference_num_gpus: null
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 4
+  inference_buffer_threshold: 2
+  inference_batch_size: 1
+  inference_fetch_batch: 1
+  aux_hidden_states_layers: [5, 19, 33, 47, 61]
+  offline:
+    # D-PACE samples random training anchors and must not inherit fixed OPD
+    # replay anchors. Use the same 60/16 medium-workload split without OPD
+    # metadata; OPD experiments have a separate 1,024-anchor configuration.
+    data_path: ${oc.env:QWEN38_OFFLINE_DATASET,/home/ubuntu/qwen38-results/offline/qwen38-dflash2-official-medium-v1-nested60-16-v1}
+    num_engines: 1
+
+logging:
+  report_to: none
+  use_wandb: false
+  use_tensorboard: false
+
+output_dir: ${oc.env:QWEN38_TRAIN_OUTPUT,/home/ubuntu/dflash2-work/torchspec-selector-v2/outputs/qwen38-dflash2-full-dpace-muon-v1}
+cache_dir: ${oc.env:QWEN38_TRAIN_CACHE,/home/ubuntu/dflash2-work/torchspec-selector-v2/cache/qwen38-dflash2-full-dpace-muon-v1}
+model_download_dir: null
+
+debug:
+  enable_perf_metrics: true
+  max_dump_steps: 5
+  memory_recorder: torch
+  profile_step_start: 0
+  profile_step_end: 0
+  profile_target: [train_overall]
+  record_memory_history: false
+  use_pytorch_profiler: false

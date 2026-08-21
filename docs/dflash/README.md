@@ -240,6 +240,23 @@ Trained on 800K PerfectBlend for 3 epochs with WSD (Warmup-Stable-Decay) LR sche
 
 ## Configuration Reference
 
+### Optimizer Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `optimizer` | `adamw` | `adamw` preserves the original optimizer path; `muon` uses Muon for eligible matrices and AdamW for the remaining tensors |
+| `muon_learning_rate` | `null` | Muon peak LR; when omitted it is 10x `learning_rate` |
+| `muon_momentum` | `0.95` | Muon momentum |
+| `muon_weight_decay` | `0.1` | Muon weight decay; independent of AdamW `weight_decay` |
+| `muon_ns_steps` | `5` | Newton-Schulz orthogonalization iterations |
+| `muon_adjust_lr_fn` | `match_rms_adamw` | PyTorch Muon LR adjustment, or `null` |
+
+The Muon path requires a PyTorch build that provides `torch.optim.Muon`.
+Non-degenerate 2D matrices are eligible except token embeddings and LM heads;
+vectors, norms, biases, embeddings, and LM heads remain on fused AdamW. The two
+optimizers share the same finite-gradient decision and are checkpointed and
+restored together, including their independent LR schedulers.
+
 ### DFlash-Specific Parameters
 
 | Parameter | Default | Description |

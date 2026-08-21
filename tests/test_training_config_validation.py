@@ -273,6 +273,39 @@ def test_load_config_rejects_negative_max_grad_norm():
         load_config(base_config=base)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("optimizer", "sgd", "optimizer"),
+        ("muon_learning_rate", 0.0, "muon_learning_rate"),
+        ("muon_momentum", 1.0, "muon_momentum"),
+        ("muon_weight_decay", -0.1, "muon_weight_decay"),
+        ("muon_ns_steps", 0, "muon_ns_steps"),
+        ("muon_adjust_lr_fn", "unsupported", "muon_adjust_lr_fn"),
+    ],
+)
+def test_load_config_rejects_invalid_muon_values(field, value, message):
+    base = _resolved_training_config(**{field: value})
+    with pytest.raises(ValueError, match=message):
+        load_config(base_config=base)
+
+
+def test_load_config_accepts_explicit_muon_configuration():
+    base = _resolved_training_config(
+        optimizer="muon",
+        muon_learning_rate=3e-3,
+        muon_momentum=0.95,
+        muon_weight_decay=0.1,
+        muon_ns_steps=5,
+        muon_adjust_lr_fn="match_rms_adamw",
+    )
+
+    config = load_config(base_config=base)
+
+    assert config.training.optimizer == "muon"
+    assert config.training.muon_learning_rate == pytest.approx(3e-3)
+
+
 def test_load_config_rejects_negative_dflash2_logits_chunk_size():
     base = _resolved_training_config(dflash2_logits_chunk_size=-1)
     with pytest.raises(ValueError, match="dflash2_logits_chunk_size"):

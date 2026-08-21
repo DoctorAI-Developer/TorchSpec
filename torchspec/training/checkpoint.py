@@ -155,9 +155,7 @@ def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
     tensors = to_internal_keys(tensors, model_keys)
     incompatible = draft_model.load_state_dict(tensors, strict=False)
     allowed_missing = (
-        {"embed_tokens.weight"}
-        if isinstance(draft_model, DFlashDraftModel)
-        else set()
+        {"embed_tokens.weight"} if isinstance(draft_model, DFlashDraftModel) else set()
     )
     missing = set(incompatible.missing_keys) - allowed_missing
     unexpected = set(incompatible.unexpected_keys)
@@ -279,19 +277,32 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
 
     if optim_dir.exists() and (optim_dir / ".metadata").exists():
         try:
+            optimizer_param_groups = (
+                opt.optimizer_param_groups()
+                if hasattr(opt, "optimizer_param_groups")
+                else opt.optimizer.param_groups
+            )
             fresh_param_groups = [
                 {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
-                for group in opt.optimizer.param_groups
+                for group in optimizer_param_groups
             ]
             optim_state = OptimizerState(actor.model, opt)
             optim_sd = {"optim_state": optim_state}
             dcp.load(state_dict=optim_sd, checkpoint_id=str(optim_dir))
-            for group, fresh_group in zip(opt.optimizer.param_groups, fresh_param_groups):
+            optimizer_param_groups = (
+                opt.optimizer_param_groups()
+                if hasattr(opt, "optimizer_param_groups")
+                else opt.optimizer.param_groups
+            )
+            for group, fresh_group in zip(optimizer_param_groups, fresh_param_groups):
                 params = group["params"]
                 group.clear()
                 group.update(copy.deepcopy(fresh_group))
                 group["params"] = params
-            opt.optimizer.state.clear()
+            if hasattr(opt, "clear_optimizer_state"):
+                opt.clear_optimizer_state()
+            else:
+                opt.optimizer.state.clear()
             logger.info(f"Loaded fp32 master params from {optim_dir}")
             return
         except Exception as e:
