@@ -201,6 +201,28 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
             else:
                 self.assertTrue(torch.equal(value, expected[key]), msg=f"{key} was not restored")
 
+    def test_dflash2_block8_checkpoint_strictly_initializes_block16_geometry(self):
+        """Block geometry changes token layout, not the learned tensor schema."""
+        block8 = _build(
+            {**_DFLASH2, "dflash_config": {"block_size": 8}},
+            seed=0,
+        )
+        directory = _publish(block8, self.tmpdir / "dflash2-block8")
+
+        block16 = _build(
+            {**_DFLASH2, "dflash_config": {"block_size": 16}},
+            seed=1,
+        )
+        self.assertEqual(block8.config.block_size, 8)
+        self.assertEqual(block16.config.block_size, 16)
+        self.assertEqual(
+            {key: tuple(value.shape) for key, value in block8.state_dict().items()},
+            {key: tuple(value.shape) for key, value in block16.state_dict().items()},
+        )
+
+        load_initial_draft_weights(block16, str(directory))
+        self._assert_matches(block16, block8)
+
     def test_loads_a_checkpoint_that_already_uses_internal_keys(self):
         published = _build(_EAGLE3, seed=0)
         directory = self.tmpdir / "native"
