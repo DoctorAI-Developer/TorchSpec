@@ -47,6 +47,7 @@ from torchspec.models.dflash import (
 from torchspec.models.dflash2 import (
     DFlash2Model,
     _tree_frontier_ranking_loss,
+    _tree_loss_perturbed_allocation_loss,
     _tree_reach_distillation_loss,
 )
 from torchspec.models.draft.auto import AutoDraftModelConfig
@@ -160,6 +161,10 @@ def _make_model(
     selector_tree_margin=0.0,
     selector_tree_path_weight=0.25,
     selector_tree_listwise_temperature=0.1,
+    selector_tree_utility_scale=0.01,
+    selector_tree_perturbation_scale=0.01,
+    selector_tree_perturbation_samples=4,
+    selector_tree_perturbation_seed=20260821,
     selector_taps_local_weight=1.0,
     selector_taps_reach_weight=0.25,
 ):
@@ -187,6 +192,10 @@ def _make_model(
         selector_tree_margin=selector_tree_margin,
         selector_tree_path_weight=selector_tree_path_weight,
         selector_tree_listwise_temperature=selector_tree_listwise_temperature,
+        selector_tree_utility_scale=selector_tree_utility_scale,
+        selector_tree_perturbation_scale=selector_tree_perturbation_scale,
+        selector_tree_perturbation_samples=selector_tree_perturbation_samples,
+        selector_tree_perturbation_seed=selector_tree_perturbation_seed,
         selector_taps_local_weight=selector_taps_local_weight,
         selector_taps_reach_weight=selector_taps_reach_weight,
         opd_rejected_k3_preserve_negative_tail=(opd_rejected_k3_preserve_negative_tail),
@@ -893,6 +902,157 @@ class TestDFlash2Forward(unittest.TestCase):
 
         self.assertTrue(torch.allclose(analytic, finite, atol=2e-4, rtol=2e-3))
 
+    def test_tree_loss_perturbed_allocation_moves_score_to_entering_gold_node(self):
+        candidate_ids = torch.tensor([[[10, 11]]], dtype=torch.int64)
+        target_ids = torch.tensor([[10]], dtype=torch.int64)
+        edge_scores = torch.tensor([[[[0.0, 0.006], [0.0, 0.0]]]], requires_grad=True)
+
+        loss = _tree_loss_perturbed_allocation_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=1,
+            depth_log_bias=-0.375,
+            utility_scale=0.01,
+            perturbation_scale=0.0,
+            perturbation_samples=1,
+            perturbation_seed=17,
+        )
+
+        self.assertGreater(loss.sum().item(), 0.0)
+        loss.sum().backward()
+        self.assertLess(edge_scores.grad[0, 0, 0, 0].item(), 0.0)
+        self.assertGreater(edge_scores.grad[0, 0, 0, 1].item(), 0.0)
+
+    def test_tree_loss_perturbed_allocation_is_zero_for_unchanged_structure(self):
+        candidate_ids = torch.tensor([[[10, 11]]], dtype=torch.int64)
+        target_ids = torch.tensor([[10]], dtype=torch.int64)
+        edge_scores = torch.tensor([[[[0.1, -0.1], [0.0, 0.0]]]], requires_grad=True)
+
+        loss = _tree_loss_perturbed_allocation_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=1,
+            depth_log_bias=-0.375,
+            utility_scale=0.01,
+            perturbation_scale=0.0,
+            perturbation_samples=1,
+            perturbation_seed=17,
+        )
+
+        self.assertEqual(loss.sum().item(), 0.0)
+        loss.sum().backward()
+        self.assertTrue(torch.equal(edge_scores.grad, torch.zeros_like(edge_scores)))
+
+    def test_tree_loss_perturbed_gradient_matches_finite_difference(self):
+        candidate_ids = torch.tensor([[[10, 11]]], dtype=torch.int64)
+        target_ids = torch.tensor([[10]], dtype=torch.int64)
+
+        def objective(values):
+            scores = values.reshape(1, 1, 2, 2)
+            return _tree_loss_perturbed_allocation_loss(
+                candidate_ids,
+                scores,
+                target_ids,
+                budget=1,
+                depth_log_bias=-0.375,
+                utility_scale=0.01,
+                perturbation_scale=0.0,
+                perturbation_samples=1,
+                perturbation_seed=17,
+            ).sum()
+
+        values = torch.tensor([0.0, 0.006, -0.3, -0.2], requires_grad=True)
+        objective(values).backward()
+        analytic = values.grad.detach().clone()
+        epsilon = 1e-5
+        finite = torch.empty_like(values)
+        with torch.no_grad():
+            for index in range(values.numel()):
+                positive = values.detach().clone()
+                negative = values.detach().clone()
+                positive[index] += epsilon
+                negative[index] -= epsilon
+                finite[index] = (objective(positive) - objective(negative)) / (2 * epsilon)
+
+        self.assertTrue(torch.allclose(analytic, finite, atol=2e-3, rtol=2e-3))
+
+    def test_tree_loss_perturbed_is_chunk_order_invariant(self):
+        candidate_ids = torch.tensor(
+            [[[10, 11], [20, 21]], [[30, 31], [40, 41]]], dtype=torch.int64
+        )
+        target_ids = torch.tensor([[10, 20], [30, 40]], dtype=torch.int64)
+        edge_scores = torch.tensor(
+            [
+                [
+                    [[0.0, 0.01], [0.0, 0.0]],
+                    [[0.0, 0.02], [0.01, 0.0]],
+                ],
+                [
+                    [[0.02, 0.0], [0.0, 0.0]],
+                    [[0.0, 0.01], [0.02, 0.0]],
+                ],
+            ]
+        )
+        kwargs = {
+            "budget": 2,
+            "depth_log_bias": -0.375,
+            "utility_scale": 0.01,
+            "perturbation_scale": 0.01,
+            "perturbation_samples": 4,
+            "perturbation_seed": 20260821,
+        }
+
+        together = _tree_loss_perturbed_allocation_loss(
+            candidate_ids, edge_scores, target_ids, **kwargs
+        )
+        separate = torch.cat(
+            [
+                _tree_loss_perturbed_allocation_loss(
+                    candidate_ids[index : index + 1],
+                    edge_scores[index : index + 1],
+                    target_ids[index : index + 1],
+                    **kwargs,
+                )
+                for index in range(2)
+            ],
+            dim=0,
+        )
+
+        self.assertTrue(torch.equal(together, separate))
+
+    def test_tree_loss_perturbed_rejects_non_monotone_scales(self):
+        candidate_ids = torch.tensor([[[10, 11]]], dtype=torch.int64)
+        edge_scores = torch.zeros(1, 1, 2, 2)
+        target_ids = torch.tensor([[10]], dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "parent-before-child"):
+            _tree_loss_perturbed_allocation_loss(
+                candidate_ids,
+                edge_scores,
+                target_ids,
+                budget=1,
+                depth_log_bias=-0.02,
+                utility_scale=0.01,
+                perturbation_scale=0.005,
+                perturbation_samples=1,
+                perturbation_seed=17,
+            )
+
+        with self.assertRaisesRegex(ValueError, "samples must be an integer"):
+            _tree_loss_perturbed_allocation_loss(
+                candidate_ids,
+                edge_scores,
+                target_ids,
+                budget=1,
+                depth_log_bias=-0.375,
+                utility_scale=0.01,
+                perturbation_scale=0.01,
+                perturbation_samples=1.5,
+                perturbation_seed=17,
+            )
+
     def test_sampling_tree_loss_combines_frontier_and_path_terms(self):
         with tempfile.TemporaryDirectory() as directory:
             map_path, map_sha256 = _write_selector_map(
@@ -1121,6 +1281,54 @@ class TestDFlash2Forward(unittest.TestCase):
 
         self.assertEqual(frontier.call_args.kwargs["listwise_temperature"], 0.125)
 
+    def test_sampling_tree_perturbed_forwards_exact_allocator_controls(self):
+        config = _make_config(
+            hidden_size=4,
+            vocab_size=6,
+            num_target_layers=1,
+            block_size=3,
+            selector_rank=2,
+            selector_top_k=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(6, dtype=torch.int64),
+            )
+            model = DFlash2Model(
+                DFlash2DraftModel(config),
+                block_size=3,
+                num_anchors=1,
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_tree_perturbed",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+                selector_verifier_temperature=0.0,
+                selector_verifier_top_k=1,
+                selector_verifier_top_p=1.0,
+                selector_tree_budget=2,
+                selector_tree_depth_log_bias=-0.375,
+                selector_tree_utility_scale=0.0125,
+                selector_tree_perturbation_scale=0.00625,
+                selector_tree_perturbation_samples=3,
+                selector_tree_perturbation_seed=37,
+            )
+        hidden = torch.randn(1, 1, 2, 4)
+        logits = torch.randn(1, 1, 2, 6)
+        targets = torch.tensor([[[5, 1, 2]]], dtype=torch.int64)
+
+        with mock.patch(
+            "torchspec.models.dflash2._tree_loss_perturbed_allocation_loss",
+            return_value=torch.zeros(1, 2),
+        ) as perturbed:
+            model._selector_tree_frontier_loss(hidden, logits, targets)
+
+        self.assertEqual(perturbed.call_args.kwargs["utility_scale"], 0.0125)
+        self.assertEqual(perturbed.call_args.kwargs["perturbation_scale"], 0.00625)
+        self.assertEqual(perturbed.call_args.kwargs["perturbation_samples"], 3)
+        self.assertEqual(perturbed.call_args.kwargs["perturbation_seed"], 37)
+
     def test_sampling_taps_builds_the_same_markov_lattice_as_serving(self):
         config = _make_config(
             hidden_size=4,
@@ -1264,6 +1472,69 @@ class TestDFlash2Forward(unittest.TestCase):
             chunked_model = _make_model(logits_chunk_size=4, **common)
         chunked_model.load_state_dict(full_model.state_dict())
         generator = torch.Generator().manual_seed(223)
+        full_hidden = torch.randn(2, 8, 16, generator=generator, requires_grad=True)
+        chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
+        target_hidden = torch.randn(2, 8, 16, generator=generator)
+        target_ids = torch.randint(0, 16, (2, 2, 4), generator=generator)
+        full_head = torch.randn(32, 16, generator=generator, requires_grad=True)
+        chunked_head = full_head.detach().clone().requires_grad_(True)
+
+        full_result = full_model._compute_token_statistics(
+            full_hidden, full_head, target_ids, target_hidden
+        )
+        chunked_result = chunked_model._compute_token_statistics(
+            chunked_hidden, chunked_head, target_ids, target_hidden
+        )
+
+        for full_value, chunked_value in zip(full_result, chunked_result, strict=True):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        (full_result[0].sum() + full_result[2].sum() + full_result[3].sum()).backward()
+        (chunked_result[0].sum() + chunked_result[2].sum() + chunked_result[3].sum()).backward()
+        self.assertTrue(torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5))
+        chunked_parameters = dict(chunked_model.named_parameters())
+        for name, full_parameter in full_model.named_parameters():
+            chunked_parameter = chunked_parameters[name]
+            if full_parameter.grad is None:
+                self.assertIsNone(chunked_parameter.grad, msg=name)
+            else:
+                self.assertTrue(
+                    torch.allclose(
+                        full_parameter.grad,
+                        chunked_parameter.grad,
+                        atol=1e-5,
+                        rtol=1e-5,
+                    ),
+                    msg=name,
+                )
+
+    def test_sampling_tree_perturbed_chunked_statistics_match_full_gradients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            common = {
+                "loss_objective": "opd",
+                "ce_loss_alpha": 0,
+                "opd_accepted_objective": "tv",
+                "selector_objective": "sampling_tree_perturbed",
+                "selector_token_map_path": map_path,
+                "selector_token_map_sha256": map_sha256,
+                "selector_verifier_temperature": 0.0,
+                "selector_verifier_top_k": 1,
+                "selector_verifier_top_p": 1.0,
+                "selector_tree_budget": 4,
+                "selector_tree_depth_log_bias": -0.375,
+                "selector_tree_utility_scale": 0.01,
+                "selector_tree_perturbation_scale": 0.01,
+                "selector_tree_perturbation_samples": 4,
+                "selector_tree_perturbation_seed": 20260821,
+            }
+            full_model = _make_model(logits_chunk_size=0, **common)
+            chunked_model = _make_model(logits_chunk_size=4, **common)
+        chunked_model.load_state_dict(full_model.state_dict())
+        generator = torch.Generator().manual_seed(229)
         full_hidden = torch.randn(2, 8, 16, generator=generator, requires_grad=True)
         chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
         target_hidden = torch.randn(2, 8, 16, generator=generator)

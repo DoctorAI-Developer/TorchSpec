@@ -103,7 +103,9 @@ def test_load_config_requires_sampling_selector_map_and_opd():
         load_config(base_config=wrong_objective)
 
 
-@pytest.mark.parametrize("objective", ("sampling_tree", "sampling_tree_listwise"))
+@pytest.mark.parametrize(
+    "objective", ("sampling_tree", "sampling_tree_listwise", "sampling_tree_perturbed")
+)
 def test_load_config_requires_explicit_sampling_tree_budget(objective):
     base = _resolved_training_config(
         dflash_loss_objective="opd",
@@ -142,6 +144,20 @@ def test_load_config_requires_explicit_sampling_taps_budget_and_greedy_target():
         load_config(base_config=non_greedy)
 
 
+def test_load_config_requires_greedy_target_for_perturbed_tree():
+    non_greedy = _resolved_training_config(
+        dflash_loss_objective="opd",
+        dflash_ce_loss_alpha=0,
+        dflash2_selector_objective="sampling_tree_perturbed",
+        dflash2_selector_token_map_path="/tmp/map.pt",
+        dflash2_selector_token_map_sha256="0" * 64,
+        dflash2_selector_tree_budget=12,
+        dflash2_selector_tree_depth_log_bias=-0.375,
+    )
+    with pytest.raises(ValueError, match="requires greedy target verification"):
+        load_config(base_config=non_greedy)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -149,6 +165,9 @@ def test_load_config_requires_explicit_sampling_taps_budget_and_greedy_target():
         ("dflash2_selector_tree_margin", -0.1, "tree_margin"),
         ("dflash2_selector_tree_path_weight", -0.1, "tree_path_weight"),
         ("dflash2_selector_tree_listwise_temperature", 0.0, "listwise_temperature"),
+        ("dflash2_selector_tree_utility_scale", 0.0, "utility_scale"),
+        ("dflash2_selector_tree_perturbation_scale", -0.1, "perturbation_scale"),
+        ("dflash2_selector_tree_perturbation_samples", 0, "perturbation_samples"),
         ("dflash2_selector_taps_local_weight", -0.1, "taps_local_weight"),
         ("dflash2_selector_taps_reach_weight", float("nan"), "taps_reach_weight"),
     ),
@@ -156,6 +175,22 @@ def test_load_config_requires_explicit_sampling_taps_budget_and_greedy_target():
 def test_load_config_rejects_invalid_selector_tree_values(field, value, message):
     base = _resolved_training_config(**{field: value})
     with pytest.raises(ValueError, match=message):
+        load_config(base_config=base)
+
+
+def test_load_config_rejects_non_monotone_perturbed_tree_scales():
+    base = _resolved_training_config(
+        dflash_loss_objective="opd",
+        dflash_ce_loss_alpha=0,
+        dflash2_selector_objective="sampling_tree_perturbed",
+        dflash2_selector_token_map_path="/tmp/map.pt",
+        dflash2_selector_token_map_sha256="0" * 64,
+        dflash2_selector_tree_budget=12,
+        dflash2_selector_tree_depth_log_bias=-0.02,
+        dflash2_selector_tree_utility_scale=0.01,
+        dflash2_selector_tree_perturbation_scale=0.005,
+    )
+    with pytest.raises(ValueError, match="parent-before-child"):
         load_config(base_config=base)
 
 

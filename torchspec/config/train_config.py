@@ -175,6 +175,8 @@ class TrainingConfig:
     # sampling_tree ranks mistakes against the exact bounded best-first serving
     # frontier; sampling_tree_listwise also regularizes correct-but-fragile
     # decisions against every live frontier competitor;
+    # sampling_tree_perturbed pairs common-random-number exact allocations
+    # before/after target-prefix utility augmentation;
     # sampling_taps distills local greedy-target preference and positive/
     # negative prefix reach over the same bounded allocator.
     dflash2_selector_objective: str = "teacher_ce"
@@ -192,6 +194,10 @@ class TrainingConfig:
     dflash2_selector_tree_margin: float = 0.0
     dflash2_selector_tree_path_weight: float = 0.25
     dflash2_selector_tree_listwise_temperature: float = 0.1
+    dflash2_selector_tree_utility_scale: float = 0.01
+    dflash2_selector_tree_perturbation_scale: float = 0.01
+    dflash2_selector_tree_perturbation_samples: int = 4
+    dflash2_selector_tree_perturbation_seed: int = 20260821
     dflash2_selector_taps_local_weight: float = 1.0
     dflash2_selector_taps_reach_weight: float = 0.25
     dflash2_opd_rejected_stream_weight: float = 1.0
@@ -381,10 +387,12 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         "sampling_taps",
         "sampling_tree",
         "sampling_tree_listwise",
+        "sampling_tree_perturbed",
     }:
         raise ValueError(
             "dflash2_selector_objective must be one of teacher_ce, sampling_tv, "
-            "sampling_path, sampling_taps, sampling_tree, or sampling_tree_listwise"
+            "sampling_path, sampling_taps, sampling_tree, sampling_tree_listwise, "
+            "or sampling_tree_perturbed"
         )
     selector_map_path = config.training.dflash2_selector_token_map_path
     selector_map_sha256 = config.training.dflash2_selector_token_map_sha256
@@ -429,6 +437,7 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         "sampling_taps",
         "sampling_tree",
         "sampling_tree_listwise",
+        "sampling_tree_perturbed",
     } and (config.training.dflash2_selector_tree_budget <= 0):
         raise ValueError(
             "bounded-tree selector objectives require a positive dflash2_selector_tree_budget"
@@ -447,6 +456,27 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         config.training.dflash2_selector_tree_listwise_temperature
     ):
         raise ValueError("dflash2_selector_tree_listwise_temperature must be finite and positive")
+    if config.training.dflash2_selector_tree_utility_scale <= 0 or not math.isfinite(
+        config.training.dflash2_selector_tree_utility_scale
+    ):
+        raise ValueError("dflash2_selector_tree_utility_scale must be finite and positive")
+    if config.training.dflash2_selector_tree_perturbation_scale < 0 or not math.isfinite(
+        config.training.dflash2_selector_tree_perturbation_scale
+    ):
+        raise ValueError("dflash2_selector_tree_perturbation_scale must be finite and non-negative")
+    if config.training.dflash2_selector_tree_perturbation_samples <= 0:
+        raise ValueError("dflash2_selector_tree_perturbation_samples must be positive")
+    if selector_objective == "sampling_tree_perturbed":
+        if config.training.dflash2_selector_tree_depth_log_bias >= 0:
+            raise ValueError("sampling_tree_perturbed requires a negative tree depth log bias")
+        if (
+            2.0 * config.training.dflash2_selector_tree_perturbation_scale
+            + config.training.dflash2_selector_tree_utility_scale
+            >= -config.training.dflash2_selector_tree_depth_log_bias
+        ):
+            raise ValueError(
+                "tree perturbation and utility scales must preserve parent-before-child ordering"
+            )
     if config.training.dflash2_selector_taps_local_weight < 0 or not math.isfinite(
         config.training.dflash2_selector_taps_local_weight
     ):
@@ -455,9 +485,10 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         config.training.dflash2_selector_taps_reach_weight
     ):
         raise ValueError("dflash2_selector_taps_reach_weight must be finite and non-negative")
-    if selector_objective == "sampling_taps":
+    if selector_objective in {"sampling_taps", "sampling_tree_perturbed"}:
         if (
-            config.training.dflash2_selector_taps_local_weight
+            selector_objective == "sampling_taps"
+            and config.training.dflash2_selector_taps_local_weight
             == config.training.dflash2_selector_taps_reach_weight
             == 0
         ):
@@ -468,7 +499,7 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
             and config.training.dflash2_selector_verifier_top_p == 1.0
         ):
             raise ValueError(
-                "sampling_taps currently requires greedy target verification "
+                f"{selector_objective} currently requires greedy target verification "
                 "(temperature=0, top_k=1, top_p=1)"
             )
     if config.training.dflash2_opd_rejected_stream_weight < 0:

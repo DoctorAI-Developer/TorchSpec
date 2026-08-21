@@ -61,6 +61,18 @@ class DFlash2Trainer(DFlashTrainer):
         self.selector_tree_listwise_temperature = getattr(
             args, "dflash2_selector_tree_listwise_temperature", 0.1
         )
+        self.selector_tree_utility_scale = getattr(
+            args, "dflash2_selector_tree_utility_scale", 0.01
+        )
+        self.selector_tree_perturbation_scale = getattr(
+            args, "dflash2_selector_tree_perturbation_scale", 0.01
+        )
+        self.selector_tree_perturbation_samples = getattr(
+            args, "dflash2_selector_tree_perturbation_samples", 4
+        )
+        self.selector_tree_perturbation_seed = getattr(
+            args, "dflash2_selector_tree_perturbation_seed", 20260821
+        )
         self.selector_taps_local_weight = getattr(args, "dflash2_selector_taps_local_weight", 1.0)
         self.selector_taps_reach_weight = getattr(args, "dflash2_selector_taps_reach_weight", 0.25)
         self.opd_rejected_stream_weight = getattr(args, "dflash2_opd_rejected_stream_weight", 1.0)
@@ -118,6 +130,10 @@ class DFlash2Trainer(DFlashTrainer):
             selector_tree_margin=self.selector_tree_margin,
             selector_tree_path_weight=self.selector_tree_path_weight,
             selector_tree_listwise_temperature=self.selector_tree_listwise_temperature,
+            selector_tree_utility_scale=self.selector_tree_utility_scale,
+            selector_tree_perturbation_scale=self.selector_tree_perturbation_scale,
+            selector_tree_perturbation_samples=self.selector_tree_perturbation_samples,
+            selector_tree_perturbation_seed=self.selector_tree_perturbation_seed,
             selector_taps_local_weight=self.selector_taps_local_weight,
             selector_taps_reach_weight=self.selector_taps_reach_weight,
             opd_rejected_stream_weight=self.opd_rejected_stream_weight,

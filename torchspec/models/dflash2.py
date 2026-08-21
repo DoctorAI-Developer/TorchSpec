@@ -36,6 +36,7 @@ _VALID_SELECTOR_OBJECTIVES = {
     "sampling_taps",
     "sampling_tree",
     "sampling_tree_listwise",
+    "sampling_tree_perturbed",
     "sampling_tv",
 }
 
@@ -213,6 +214,266 @@ def _tree_frontier_ranking_loss(
     return torch.zeros((batch, depth_limit), device=device, dtype=losses.dtype).scatter_add(
         1, depths, losses
     )
+
+
+_TREE_HASH_MODULUS = 2_147_483_647
+
+
+def _mix_tree_hash(key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """Mix non-negative int64 tensors without overflowing signed int64."""
+    return torch.remainder(key * 48_271 + value * 69_621 + 1, _TREE_HASH_MODULUS)
+
+
+def _tree_block_hash(
+    candidate_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    seed: int,
+) -> torch.Tensor:
+    """Build a chunk/order-invariant key for each replay block."""
+    batch, depth_limit, _ = candidate_ids.shape
+    key = torch.full(
+        (batch,),
+        int(seed) % _TREE_HASH_MODULUS,
+        device=candidate_ids.device,
+        dtype=torch.int64,
+    )
+    for depth in range(depth_limit):
+        key = _mix_tree_hash(key, target_ids[:, depth])
+        key = _mix_tree_hash(key, candidate_ids[:, depth].sum(dim=-1))
+    return key
+
+
+def _tree_node_noise(path_hash: torch.Tensor, *, sample: int | torch.Tensor) -> torch.Tensor:
+    """Return deterministic continuous-looking noise in [-1, 1]."""
+    if isinstance(sample, torch.Tensor):
+        sample_key = (sample.to(device=path_hash.device, dtype=torch.int64) + 1).expand_as(
+            path_hash
+        )
+    else:
+        sample_key = torch.full_like(path_hash, sample + 1)
+    mixed = _mix_tree_hash(path_hash, sample_key)
+    uniform = (mixed.to(torch.float32) + 0.5) / float(_TREE_HASH_MODULUS)
+    return uniform.mul(2.0).sub(1.0)
+
+
+def _tree_loss_perturbed_allocation_loss(
+    candidate_ids: torch.Tensor,
+    edge_scores: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    budget: int,
+    depth_log_bias: float,
+    utility_scale: float,
+    perturbation_scale: float,
+    perturbation_samples: int,
+    perturbation_seed: int,
+) -> torch.Tensor:
+    """Estimate direct task-loss gradients through the exact tree builder.
+
+    Each Monte Carlo sample runs two discrete, prefix-closed allocations. The
+    base and utility-augmented runs share the same deterministic path-keyed
+    perturbation (common random numbers). The augmented run adds one unit of
+    utility to each reachable target-prefix node. Choices are stop-gradient;
+    the returned score difference supplies the direct-loss gradient that
+    increases nodes entering the useful tree and decreases nodes they displace.
+
+    Noise is bounded at configuration time so the deployed negative depth
+    reward continues to make descendants score below their parent. Stateless
+    path keys make the estimator invariant to logit chunking and recomputation.
+    """
+    if candidate_ids.ndim != 3:
+        raise ValueError("candidate_ids must have shape [batch, depth, top_k]")
+    batch, depth_limit, top_k = map(int, candidate_ids.shape)
+    if edge_scores.shape != (batch, depth_limit, top_k, top_k):
+        raise ValueError("candidate IDs and edge scores have incompatible shapes")
+    if target_ids.shape != (batch, depth_limit):
+        raise ValueError("target_ids must have shape [batch, depth]")
+    if candidate_ids.dtype != torch.int64 or target_ids.dtype != torch.int64:
+        raise ValueError("candidate_ids and target_ids must use torch.int64")
+    if budget <= 0 or budget > depth_limit * top_k:
+        raise ValueError("tree budget must be in [1, depth * top_k]")
+    if not math.isfinite(depth_log_bias):
+        raise ValueError("tree depth log bias must be finite")
+    if utility_scale <= 0 or not math.isfinite(utility_scale):
+        raise ValueError("tree utility perturbation scale must be finite and positive")
+    if perturbation_scale < 0 or not math.isfinite(perturbation_scale):
+        raise ValueError("tree random perturbation scale must be finite and non-negative")
+    if not isinstance(perturbation_samples, int) or isinstance(perturbation_samples, bool):
+        raise ValueError("tree perturbation samples must be an integer")
+    if perturbation_samples <= 0:
+        raise ValueError("tree perturbation samples must be positive")
+    if not isinstance(perturbation_seed, int) or isinstance(perturbation_seed, bool):
+        raise ValueError("tree perturbation seed must be an integer")
+    # A node at depth d is at least abs(depth_log_bias) below its parent before
+    # perturbation because log probabilities are non-positive. Keep paired
+    # noise and the one-node utility augmentation inside that monotonic gap.
+    if depth_log_bias >= 0:
+        raise ValueError("loss-perturbed tree allocation requires a negative depth log bias")
+    if 2.0 * perturbation_scale + utility_scale >= -depth_log_bias:
+        raise ValueError(
+            "tree perturbation and utility scales must preserve parent-before-child ordering"
+        )
+    if batch == 0:
+        return edge_scores.new_zeros((0, depth_limit), dtype=torch.float32)
+
+    log_probs = torch.log_softmax(edge_scores.float(), dim=-1)
+    device = edge_scores.device
+    source_batch = batch
+    # Vectorize all Monte Carlo samples and both paired arms into one allocator
+    # call. This preserves common random numbers and avoids 2*S repetitions of
+    # the builder's small GPU kernels.
+    candidate_ids = (
+        candidate_ids.unsqueeze(0)
+        .unsqueeze(1)
+        .expand(perturbation_samples, 2, -1, -1, -1)
+        .reshape(-1, depth_limit, top_k)
+    )
+    target_ids = (
+        target_ids.unsqueeze(0)
+        .unsqueeze(1)
+        .expand(perturbation_samples, 2, -1, -1)
+        .reshape(-1, depth_limit)
+    )
+    log_probs = (
+        log_probs.unsqueeze(0)
+        .unsqueeze(1)
+        .expand(perturbation_samples, 2, -1, -1, -1, -1)
+        .reshape(-1, depth_limit, top_k, top_k)
+    )
+    base_block_hash = _tree_block_hash(
+        candidate_ids[:source_batch], target_ids[:source_batch], seed=perturbation_seed
+    )
+    block_hash = (
+        base_block_hash.view(1, 1, source_batch).expand(perturbation_samples, 2, -1).reshape(-1)
+    )
+    sample_ids = (
+        torch.arange(perturbation_samples, device=device, dtype=torch.int64)
+        .view(-1, 1, 1)
+        .expand(-1, 2, source_batch)
+        .reshape(-1)
+    )
+    target_utility = (
+        torch.tensor((0.0, utility_scale), device=device, dtype=torch.float32)
+        .view(1, 2, 1)
+        .expand(perturbation_samples, -1, source_batch)
+        .reshape(-1)
+    )
+    batch = int(candidate_ids.shape[0])
+    batch_index = torch.arange(batch, device=device)
+    child_grid = torch.arange(top_k, device=device, dtype=torch.int64).view(1, 1, -1)
+
+    def allocate() -> torch.Tensor:
+        selected_parent: list[torch.Tensor] = []
+        selected_depth: list[torch.Tensor] = []
+        selected_child: list[torch.Tensor] = []
+        selected_cumulative: list[torch.Tensor] = []
+        selected_path_hash: list[torch.Tensor] = []
+        selected_gold: list[torch.Tensor] = []
+        chosen_model_scores: list[torch.Tensor] = []
+        chosen_depths: list[torch.Tensor] = []
+
+        for iteration in range(budget):
+            parent_slots = iteration + 1
+            parent_index = torch.arange(parent_slots, device=device, dtype=torch.int64)
+            if iteration == 0:
+                next_depth = torch.zeros((batch, 1), dtype=torch.int64, device=device)
+                predecessor = torch.zeros_like(next_depth)
+                parent_cumulative = edge_scores.new_zeros((batch, 1), dtype=torch.float32)
+                parent_path_hash = block_hash[:, None]
+                parent_gold = torch.ones((batch, 1), dtype=torch.bool, device=device)
+            else:
+                next_depth = torch.stack(
+                    [torch.zeros_like(selected_depth[0]), *selected_depth], dim=1
+                )
+                predecessor = torch.stack(
+                    [torch.zeros_like(selected_child[0]), *selected_child], dim=1
+                )
+                parent_cumulative = torch.stack(
+                    [torch.zeros_like(selected_cumulative[0]), *selected_cumulative], dim=1
+                )
+                parent_path_hash = torch.stack([block_hash, *selected_path_hash], dim=1)
+                parent_gold = torch.stack(
+                    [torch.ones_like(selected_gold[0]), *selected_gold], dim=1
+                )
+
+            valid_parent = next_depth < depth_limit
+            safe_depth = next_depth.clamp_max(depth_limit - 1)
+            score_rows = log_probs[batch_index[:, None], safe_depth, predecessor]
+            raw_cumulative = parent_cumulative.unsqueeze(-1) + score_rows
+            model_scores = (
+                raw_cumulative + (safe_depth.to(torch.float32).unsqueeze(-1) + 1.0) * depth_log_bias
+            )
+            token_rows = candidate_ids[batch_index[:, None], safe_depth]
+            path_hash = _mix_tree_hash(
+                parent_path_hash.unsqueeze(-1),
+                token_rows + (safe_depth.unsqueeze(-1) + 1) * 1_000_003,
+            )
+            random_noise = _tree_node_noise(path_hash, sample=sample_ids.view(batch, 1, 1))
+            target_rows = target_ids[batch_index[:, None], safe_depth]
+            gold_node = parent_gold.unsqueeze(-1) & token_rows.eq(target_rows.unsqueeze(-1))
+            allocation_scores = (
+                model_scores
+                + perturbation_scale * random_noise
+                + target_utility.view(batch, 1, 1) * gold_node.to(torch.float32)
+            )
+
+            valid = valid_parent.unsqueeze(-1).expand(-1, -1, top_k).clone()
+            parent_grid = parent_index.view(1, -1, 1)
+            for old_parent, old_child in zip(selected_parent, selected_child, strict=True):
+                valid &= ~(
+                    parent_grid.eq(old_parent[:, None, None])
+                    & child_grid.eq(old_child[:, None, None])
+                )
+
+            detached_scores = allocation_scores.detach().masked_fill(~valid, -torch.inf)
+            best = detached_scores.amax(dim=(1, 2), keepdim=True)
+            tied = valid & detached_scores.eq(best)
+            sentinel = torch.iinfo(torch.int64).max
+
+            depth_key = safe_depth.unsqueeze(-1).expand(-1, -1, top_k)
+            best_depth = torch.where(tied, depth_key, sentinel).amin(dim=(1, 2), keepdim=True)
+            tied &= depth_key.eq(best_depth)
+
+            expanded_parent = parent_grid.expand(batch, -1, top_k)
+            best_parent = torch.where(tied, expanded_parent, sentinel).amin(
+                dim=(1, 2), keepdim=True
+            )
+            tied &= expanded_parent.eq(best_parent)
+
+            best_token = torch.where(tied, token_rows, sentinel).amin(dim=(1, 2), keepdim=True)
+            tied &= token_rows.eq(best_token)
+
+            expanded_child = child_grid.expand(batch, parent_slots, -1)
+            best_child = torch.where(tied, expanded_child, sentinel).amin(dim=(1, 2), keepdim=True)
+            tied &= expanded_child.eq(best_child)
+            flat_choices = torch.where(
+                tied.reshape(batch, -1),
+                torch.arange(parent_slots * top_k, device=device, dtype=torch.int64),
+                sentinel,
+            ).amin(dim=1)
+            chosen_parent = flat_choices // top_k
+            chosen_child = flat_choices % top_k
+
+            chosen_raw = raw_cumulative[batch_index, chosen_parent, chosen_child]
+            chosen_depth = next_depth[batch_index, chosen_parent]
+            selected_parent.append(chosen_parent)
+            selected_depth.append(chosen_depth + 1)
+            selected_child.append(chosen_child)
+            selected_cumulative.append(chosen_raw)
+            selected_path_hash.append(path_hash[batch_index, chosen_parent, chosen_child])
+            selected_gold.append(gold_node[batch_index, chosen_parent, chosen_child])
+            chosen_model_scores.append(model_scores[batch_index, chosen_parent, chosen_child])
+            chosen_depths.append(chosen_depth)
+
+        structure_scores = torch.stack(chosen_model_scores, dim=1)
+        structure_depths = torch.stack(chosen_depths, dim=1)
+        return torch.zeros(
+            (batch, depth_limit), device=device, dtype=structure_scores.dtype
+        ).scatter_add(1, structure_depths, structure_scores)
+
+    paired_scores = allocate().reshape(perturbation_samples, 2, source_batch, depth_limit)
+    return (paired_scores[:, 0] - paired_scores[:, 1]).mean(dim=0) / (utility_scale * budget)
 
 
 def _tree_reach_distillation_loss(
@@ -483,6 +744,10 @@ class DFlash2Model(DFlashModel):
         selector_tree_margin: float = 0.0,
         selector_tree_path_weight: float = 0.25,
         selector_tree_listwise_temperature: float = 0.1,
+        selector_tree_utility_scale: float = 0.01,
+        selector_tree_perturbation_scale: float = 0.01,
+        selector_tree_perturbation_samples: int = 4,
+        selector_tree_perturbation_seed: int = 20260821,
         selector_taps_local_weight: float = 1.0,
         selector_taps_reach_weight: float = 0.25,
         logits_chunk_size: int = 0,
@@ -516,6 +781,18 @@ class DFlash2Model(DFlashModel):
         self.selector_tree_margin = float(selector_tree_margin)
         self.selector_tree_path_weight = float(selector_tree_path_weight)
         self.selector_tree_listwise_temperature = float(selector_tree_listwise_temperature)
+        self.selector_tree_utility_scale = float(selector_tree_utility_scale)
+        self.selector_tree_perturbation_scale = float(selector_tree_perturbation_scale)
+        if not isinstance(selector_tree_perturbation_samples, int) or isinstance(
+            selector_tree_perturbation_samples, bool
+        ):
+            raise ValueError("dflash2_selector_tree_perturbation_samples must be an integer")
+        if not isinstance(selector_tree_perturbation_seed, int) or isinstance(
+            selector_tree_perturbation_seed, bool
+        ):
+            raise ValueError("dflash2_selector_tree_perturbation_seed must be an integer")
+        self.selector_tree_perturbation_samples = selector_tree_perturbation_samples
+        self.selector_tree_perturbation_seed = selector_tree_perturbation_seed
         self.selector_taps_local_weight = float(selector_taps_local_weight)
         self.selector_taps_reach_weight = float(selector_taps_reach_weight)
         if not math.isfinite(self.selector_temperature) or self.selector_temperature <= 0:
@@ -536,6 +813,7 @@ class DFlash2Model(DFlashModel):
             "sampling_taps",
             "sampling_tree",
             "sampling_tree_listwise",
+            "sampling_tree_perturbed",
         }:
             max_tree_budget = (self.block_size - 1) * int(config.selector_top_k)
             if not 1 <= self.selector_tree_budget <= max_tree_budget:
@@ -555,6 +833,28 @@ class DFlash2Model(DFlashModel):
             raise ValueError(
                 "dflash2_selector_tree_listwise_temperature must be finite and positive"
             )
+        if self.selector_tree_utility_scale <= 0 or not math.isfinite(
+            self.selector_tree_utility_scale
+        ):
+            raise ValueError("dflash2_selector_tree_utility_scale must be finite and positive")
+        if self.selector_tree_perturbation_scale < 0 or not math.isfinite(
+            self.selector_tree_perturbation_scale
+        ):
+            raise ValueError(
+                "dflash2_selector_tree_perturbation_scale must be finite and non-negative"
+            )
+        if self.selector_tree_perturbation_samples <= 0:
+            raise ValueError("dflash2_selector_tree_perturbation_samples must be positive")
+        if self.selector_objective == "sampling_tree_perturbed":
+            if self.selector_tree_depth_log_bias >= 0:
+                raise ValueError("sampling_tree_perturbed requires a negative tree depth log bias")
+            if (
+                2.0 * self.selector_tree_perturbation_scale + self.selector_tree_utility_scale
+                >= -self.selector_tree_depth_log_bias
+            ):
+                raise ValueError(
+                    "tree perturbation and utility scales must preserve parent-before-child ordering"
+                )
         if self.selector_taps_local_weight < 0 or not math.isfinite(
             self.selector_taps_local_weight
         ):
@@ -563,8 +863,11 @@ class DFlash2Model(DFlashModel):
             self.selector_taps_reach_weight
         ):
             raise ValueError("dflash2_selector_taps_reach_weight must be finite and non-negative")
-        if self.selector_objective == "sampling_taps":
-            if self.selector_taps_local_weight == self.selector_taps_reach_weight == 0:
+        if self.selector_objective in {"sampling_taps", "sampling_tree_perturbed"}:
+            if (
+                self.selector_objective == "sampling_taps"
+                and self.selector_taps_local_weight == self.selector_taps_reach_weight == 0
+            ):
                 raise ValueError("sampling_taps requires a positive local or reach weight")
             if not (
                 self.selector_verifier_temperature == 0.0
@@ -572,7 +875,7 @@ class DFlash2Model(DFlashModel):
                 and self.selector_verifier_top_p == 1.0
             ):
                 raise ValueError(
-                    "sampling_taps currently requires greedy target verification "
+                    f"{self.selector_objective} currently requires greedy target verification "
                     "(temperature=0, top_k=1, top_p=1)"
                 )
 
@@ -760,19 +1063,33 @@ class DFlash2Model(DFlashModel):
         flat_candidates = candidate_ids.reshape(-1, depth_limit, top_k)
         flat_scores = edge_scores.reshape(-1, depth_limit, top_k, top_k)
         flat_targets = target_ids[..., 1:].reshape(-1, depth_limit)
-        return _tree_frontier_ranking_loss(
-            flat_candidates,
-            flat_scores,
-            flat_targets,
-            budget=self.selector_tree_budget,
-            depth_log_bias=self.selector_tree_depth_log_bias,
-            margin=self.selector_tree_margin,
-            listwise_temperature=(
-                self.selector_tree_listwise_temperature
-                if self.selector_objective == "sampling_tree_listwise"
-                else None
-            ),
-        ).reshape(*target_ids.shape[:-1], depth_limit)
+        if self.selector_objective == "sampling_tree_perturbed":
+            tree_loss = _tree_loss_perturbed_allocation_loss(
+                flat_candidates,
+                flat_scores,
+                flat_targets,
+                budget=self.selector_tree_budget,
+                depth_log_bias=self.selector_tree_depth_log_bias,
+                utility_scale=self.selector_tree_utility_scale,
+                perturbation_scale=self.selector_tree_perturbation_scale,
+                perturbation_samples=self.selector_tree_perturbation_samples,
+                perturbation_seed=self.selector_tree_perturbation_seed,
+            )
+        else:
+            tree_loss = _tree_frontier_ranking_loss(
+                flat_candidates,
+                flat_scores,
+                flat_targets,
+                budget=self.selector_tree_budget,
+                depth_log_bias=self.selector_tree_depth_log_bias,
+                margin=self.selector_tree_margin,
+                listwise_temperature=(
+                    self.selector_tree_listwise_temperature
+                    if self.selector_objective == "sampling_tree_listwise"
+                    else None
+                ),
+            )
+        return tree_loss.reshape(*target_ids.shape[:-1], depth_limit)
 
     def _selector_tree_taps_loss(
         self,
@@ -908,7 +1225,11 @@ class DFlash2Model(DFlashModel):
                     target_indices.reshape(-1),
                     reduction="none",
                 ).reshape_as(target_indices)
-            elif self.selector_objective in {"sampling_tree", "sampling_tree_listwise"}:
+            elif self.selector_objective in {
+                "sampling_tree",
+                "sampling_tree_listwise",
+                "sampling_tree_perturbed",
+            }:
                 selector_overlap = self._selector_sampling_overlap(
                     hidden[..., 1:, :],
                     chunk_logits[..., 1:, :],
@@ -1024,6 +1345,7 @@ class DFlash2Model(DFlashModel):
             "sampling_taps",
             "sampling_tree",
             "sampling_tree_listwise",
+            "sampling_tree_perturbed",
         }:
             expected_shape = (*eligible_weights.shape, 2)
             if logits.shape != expected_shape:
@@ -1032,7 +1354,11 @@ class DFlash2Model(DFlashModel):
                     f"two-component statistics, got {tuple(logits.shape)} "
                     f"instead of {expected_shape}"
                 )
-            if self.selector_objective in {"sampling_tree", "sampling_tree_listwise"}:
+            if self.selector_objective in {
+                "sampling_tree",
+                "sampling_tree_listwise",
+                "sampling_tree_perturbed",
+            }:
                 tree_loss = logits[..., 0]
                 selector_payload = logits[..., 1]
             else:
@@ -1074,6 +1400,7 @@ class DFlash2Model(DFlashModel):
             "sampling_path",
             "sampling_tree",
             "sampling_tree_listwise",
+            "sampling_tree_perturbed",
         }:
             overlap = selector_payload
             valid_prefix = (eligible_weights > 0).to(torch.int64).cumprod(dim=-1).bool()
@@ -1082,7 +1409,11 @@ class DFlash2Model(DFlashModel):
                 dim=-1,
             )
             path_loss = 1.0 - prefix_survival
-            if self.selector_objective in {"sampling_tree", "sampling_tree_listwise"}:
+            if self.selector_objective in {
+                "sampling_tree",
+                "sampling_tree_listwise",
+                "sampling_tree_perturbed",
+            }:
                 selector_loss = tree_loss + self.selector_tree_path_weight * path_loss
                 tree_num = (tree_loss * eligible_weights).sum()
                 tree_den = eligible_weights.sum().detach()
