@@ -32,6 +32,7 @@ class DFlash2Trainer(DFlashTrainer):
     _extra_loss_component_keys = [
         "selector_loss",
         "selector_overlap",
+        "selector_tree_loss",
         "opd_rejected_loss",
     ]
 
@@ -41,38 +42,32 @@ class DFlash2Trainer(DFlashTrainer):
         self.selector_loss_alpha = getattr(args, "dflash2_selector_loss_alpha", 1.0)
         self.trainable_scope = getattr(args, "dflash2_trainable_scope", "all")
         self.selector_objective = getattr(args, "dflash2_selector_objective", "teacher_ce")
-        self.selector_token_map_path = getattr(
-            args, "dflash2_selector_token_map_path", None
-        )
-        self.selector_token_map_sha256 = getattr(
-            args, "dflash2_selector_token_map_sha256", None
-        )
+        self.selector_token_map_path = getattr(args, "dflash2_selector_token_map_path", None)
+        self.selector_token_map_sha256 = getattr(args, "dflash2_selector_token_map_sha256", None)
         self.selector_temperature = getattr(args, "dflash2_selector_temperature", 1.0)
         self.selector_verifier_temperature = getattr(
             args, "dflash2_selector_verifier_temperature", 1.0
         )
-        self.selector_verifier_top_k = getattr(
-            args, "dflash2_selector_verifier_top_k", 20
+        self.selector_verifier_top_k = getattr(args, "dflash2_selector_verifier_top_k", 20)
+        self.selector_verifier_top_p = getattr(args, "dflash2_selector_verifier_top_p", 0.95)
+        self.selector_tree_budget = getattr(args, "dflash2_selector_tree_budget", 0)
+        self.selector_tree_depth_log_bias = getattr(
+            args, "dflash2_selector_tree_depth_log_bias", 0.0
         )
-        self.selector_verifier_top_p = getattr(
-            args, "dflash2_selector_verifier_top_p", 0.95
-        )
+        self.selector_tree_margin = getattr(args, "dflash2_selector_tree_margin", 0.0)
+        self.selector_tree_path_weight = getattr(args, "dflash2_selector_tree_path_weight", 0.25)
         self.opd_rejected_stream_weight = getattr(args, "dflash2_opd_rejected_stream_weight", 1.0)
         self.opd_rejected_position_decay = getattr(args, "dflash2_opd_rejected_position_decay", 0.8)
         self.opd_rejected_k3_preserve_negative_tail = getattr(
             args, "dflash2_opd_rejected_k3_preserve_negative_tail", False
         )
-        self.opd_accepted_objective = getattr(
-            args, "dflash2_opd_accepted_objective", "forward_kl"
-        )
+        self.opd_accepted_objective = getattr(args, "dflash2_opd_accepted_objective", "forward_kl")
 
     def _configure_trainable_parameters(self, draft_model) -> None:
         if self.trainable_scope == "all":
             return
         if self.trainable_scope != "selector_only":
-            raise ValueError(
-                "dflash2_trainable_scope must be one of all or selector_only"
-            )
+            raise ValueError("dflash2_trainable_scope must be one of all or selector_only")
         for parameter in draft_model.parameters():
             parameter.requires_grad = False
         for parameter in draft_model.candidate_selector.parameters():
@@ -111,10 +106,12 @@ class DFlash2Trainer(DFlashTrainer):
             selector_verifier_temperature=self.selector_verifier_temperature,
             selector_verifier_top_k=self.selector_verifier_top_k,
             selector_verifier_top_p=self.selector_verifier_top_p,
+            selector_tree_budget=self.selector_tree_budget,
+            selector_tree_depth_log_bias=self.selector_tree_depth_log_bias,
+            selector_tree_margin=self.selector_tree_margin,
+            selector_tree_path_weight=self.selector_tree_path_weight,
             opd_rejected_stream_weight=self.opd_rejected_stream_weight,
             opd_rejected_position_decay=self.opd_rejected_position_decay,
-            opd_rejected_k3_preserve_negative_tail=(
-                self.opd_rejected_k3_preserve_negative_tail
-            ),
+            opd_rejected_k3_preserve_negative_tail=(self.opd_rejected_k3_preserve_negative_tail),
             opd_accepted_objective=self.opd_accepted_objective,
         )

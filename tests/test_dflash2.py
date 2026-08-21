@@ -44,7 +44,7 @@ from torchspec.models.dflash import (
     _dpace_position_weights,
     _total_variation_loss,
 )
-from torchspec.models.dflash2 import DFlash2Model
+from torchspec.models.dflash2 import DFlash2Model, _tree_frontier_ranking_loss
 from torchspec.models.draft.auto import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.models.draft.dflash2 import (
@@ -151,6 +151,10 @@ def _make_model(
     selector_verifier_temperature=1.0,
     selector_verifier_top_k=20,
     selector_verifier_top_p=0.95,
+    selector_tree_budget=0,
+    selector_tree_depth_log_bias=0.0,
+    selector_tree_margin=0.0,
+    selector_tree_path_weight=0.25,
 ):
     config = _make_config()
     draft = DFlash2DraftModel(config).to(dtype=torch.float32)
@@ -171,9 +175,11 @@ def _make_model(
         selector_verifier_temperature=selector_verifier_temperature,
         selector_verifier_top_k=selector_verifier_top_k,
         selector_verifier_top_p=selector_verifier_top_p,
-        opd_rejected_k3_preserve_negative_tail=(
-            opd_rejected_k3_preserve_negative_tail
-        ),
+        selector_tree_budget=selector_tree_budget,
+        selector_tree_depth_log_bias=selector_tree_depth_log_bias,
+        selector_tree_margin=selector_tree_margin,
+        selector_tree_path_weight=selector_tree_path_weight,
+        opd_rejected_k3_preserve_negative_tail=(opd_rejected_k3_preserve_negative_tail),
         opd_accepted_objective=opd_accepted_objective,
     )
 
@@ -212,14 +218,10 @@ class TestDFlash2Config(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory, "config.json")
             config_path.write_text(
-                json.dumps(
-                    _tiny_config_kwargs(architectures=["DFlash2DraftModel"])
-                )
+                json.dumps(_tiny_config_kwargs(architectures=["DFlash2DraftModel"]))
             )
 
-            config = _get_draft_model_config(
-                Namespace(draft_model_config=directory)
-            )
+            config = _get_draft_model_config(Namespace(draft_model_config=directory))
 
         self.assertIsInstance(config, DFlash2Config)
 
@@ -686,9 +688,7 @@ class TestDFlash2Forward(unittest.TestCase):
             [[[3.0, 2.0, 0.0, 100.0], [2.0, 3.0, 0.0, 100.0]]],
             requires_grad=True,
         )
-        target_logits = torch.tensor(
-            [[[2.5, 2.0, -4.0, -4.0], [1.5, 2.5, -4.0, -4.0]]]
-        )
+        target_logits = torch.tensor([[[2.5, 2.0, -4.0, -4.0], [1.5, 2.5, -4.0, -4.0]]])
         predecessor_ids = torch.tensor([[2, 1]])
 
         actual = model._selector_sampling_overlap(
@@ -753,6 +753,154 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue(torch.isfinite(overlap.grad).all())
         self.assertTrue((overlap.grad < 0).all())
 
+    def test_tree_frontier_loss_penalizes_the_actual_blocking_edge(self):
+        candidate_ids = torch.tensor([[[10, 11], [20, 21]]], dtype=torch.int64)
+        # The gold root is admitted first. Its non-gold sibling at depth one
+        # then outranks the gold child, so only the second target depth is
+        # blocked and receives a gradient.
+        edge_scores = torch.tensor(
+            [[[[2.0, 0.0], [2.0, 0.0]], [[-4.0, 0.0], [0.0, 0.0]]]],
+            requires_grad=True,
+        )
+        target_ids = torch.tensor([[10, 20]], dtype=torch.int64)
+
+        loss = _tree_frontier_ranking_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=2,
+            depth_log_bias=0.0,
+            margin=0.0,
+        )
+
+        self.assertEqual(loss[0, 0].item(), 0.0)
+        self.assertGreater(loss[0, 1].item(), 0.0)
+        loss.sum().backward()
+        self.assertLess(edge_scores.grad[0, 1, 0, 0].item(), 0.0)
+        self.assertGreater(edge_scores.grad[0, 1, 0, 1].item(), 0.0)
+
+    def test_tree_frontier_loss_uses_the_serving_depth_reward(self):
+        candidate_ids = torch.tensor([[[10, 11], [20, 21]]], dtype=torch.int64)
+        edge_scores = torch.tensor([[[[0.4, 0.0], [0.4, 0.0]], [[0.04, 0.0], [0.0, 0.0]]]])
+        target_ids = torch.tensor([[10, 20]], dtype=torch.int64)
+
+        breadth_first = _tree_frontier_ranking_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=2,
+            depth_log_bias=-0.375,
+            margin=0.0,
+        )
+        deeper_first = _tree_frontier_ranking_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=2,
+            depth_log_bias=0.5,
+            margin=0.0,
+        )
+
+        self.assertGreater(breadth_first[0, 1].item(), 0.0)
+        self.assertEqual(deeper_first.sum().item(), 0.0)
+
+    def test_sampling_tree_loss_combines_frontier_and_path_terms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            model = _make_model(
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_tree",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+                selector_tree_budget=4,
+                selector_tree_path_weight=0.25,
+            )
+        tree_loss = torch.tensor([[[0.2, 0.3, 0.4]]], requires_grad=True)
+        overlap = torch.tensor([[[0.5, 0.5, 0.5]]], requires_grad=True)
+        payload = torch.stack((tree_loss, overlap), dim=-1)
+        weights = torch.tensor([[[0.0, 1.0, 1.0, 1.0]]])
+
+        extra_numerator, components = model._extra_training_loss(
+            torch.zeros(1, 4, 16),
+            payload,
+            torch.zeros(1, 1, 4, dtype=torch.long),
+            weights,
+            weights,
+        )
+
+        path_sum = (1 - 0.5) + (1 - 0.25) + (1 - 0.125)
+        expected = model.selector_loss_alpha * (0.9 + 0.25 * path_sum)
+        self.assertTrue(torch.allclose(extra_numerator, torch.tensor(expected)))
+        tree_num, tree_den = components["selector_tree_loss"]
+        self.assertTrue(torch.allclose(tree_num, torch.tensor(0.9)))
+        self.assertEqual(tree_den.item(), 3.0)
+        extra_numerator.backward()
+        self.assertTrue((tree_loss.grad > 0).all())
+        self.assertTrue((overlap.grad < 0).all())
+
+    def test_sampling_tree_builds_the_same_markov_lattice_as_serving(self):
+        config = _make_config(
+            hidden_size=4,
+            vocab_size=6,
+            num_target_layers=1,
+            block_size=3,
+            selector_rank=2,
+            selector_top_k=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(6, dtype=torch.int64),
+            )
+            model = DFlash2Model(
+                DFlash2DraftModel(config),
+                block_size=3,
+                num_anchors=1,
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_tree",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+                selector_verifier_temperature=0.0,
+                selector_verifier_top_k=1,
+                selector_verifier_top_p=1.0,
+                selector_tree_budget=2,
+            )
+        selector = model.draft_model.candidate_selector
+        hidden = torch.randn(1, 1, 2, 4)
+        logits = torch.randn(1, 1, 2, 6)
+        targets = torch.tensor([[[5, 1, 2]]], dtype=torch.int64)
+
+        with mock.patch(
+            "torchspec.models.dflash2._tree_frontier_ranking_loss",
+            return_value=torch.zeros(1, 2),
+        ) as frontier:
+            actual = model._selector_tree_frontier_loss(hidden, logits, targets)
+
+        captured_candidates, captured_scores, captured_targets = frontier.call_args.args
+        unary, local_ids = torch.topk(logits, 2, dim=-1, sorted=False)
+        expected_candidates = local_ids
+        projected = selector.hidden_projection(hidden)
+        predecessor_ids = torch.cat(
+            (targets[..., :1, None].expand(1, 1, 1, 2), expected_candidates[..., :-1, :]),
+            dim=-2,
+        )
+        predecessor = selector.predecessor_codebook[predecessor_ids] * projected.unsqueeze(-2)
+        successor = selector.successor_codebook[expected_candidates]
+        expected_scores = unary.unsqueeze(-2) + torch.einsum(
+            "...dpr,...dcr->...dpc", predecessor, successor
+        )
+
+        self.assertEqual(tuple(actual.shape), (1, 1, 2))
+        self.assertTrue(torch.equal(captured_candidates, expected_candidates.reshape(1, 2, 2)))
+        self.assertTrue(torch.equal(captured_targets, targets[..., 1:].reshape(1, 2)))
+        self.assertTrue(torch.allclose(captured_scores, expected_scores.reshape(1, 2, 2, 2)))
+        self.assertEqual(frontier.call_args.kwargs["budget"], 2)
+
     def test_sampling_selector_chunked_statistics_match_full_gradients(self):
         with tempfile.TemporaryDirectory() as directory:
             map_path, map_sha256 = _write_selector_map(
@@ -793,21 +941,68 @@ class TestDFlash2Forward(unittest.TestCase):
         )
 
         for full_value, chunked_value in zip(full_result, chunked_result, strict=True):
-            self.assertTrue(
-                torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6)
-            )
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
         (full_result[0].sum() + full_result[2].sum() + full_result[3].sum()).backward()
-        (
-            chunked_result[0].sum()
-            + chunked_result[2].sum()
-            + chunked_result[3].sum()
-        ).backward()
-        self.assertTrue(
-            torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5)
+        (chunked_result[0].sum() + chunked_result[2].sum() + chunked_result[3].sum()).backward()
+        self.assertTrue(torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5))
+        chunked_parameters = dict(chunked_model.named_parameters())
+        for name, full_parameter in full_model.named_parameters():
+            chunked_parameter = chunked_parameters[name]
+            if full_parameter.grad is None:
+                self.assertIsNone(chunked_parameter.grad, msg=name)
+            else:
+                self.assertTrue(
+                    torch.allclose(
+                        full_parameter.grad,
+                        chunked_parameter.grad,
+                        atol=1e-5,
+                        rtol=1e-5,
+                    ),
+                    msg=name,
+                )
+
+    def test_sampling_tree_chunked_statistics_match_full_gradients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(16, dtype=torch.int64),
+            )
+            common = {
+                "loss_objective": "opd",
+                "ce_loss_alpha": 0,
+                "opd_accepted_objective": "tv",
+                "selector_objective": "sampling_tree",
+                "selector_token_map_path": map_path,
+                "selector_token_map_sha256": map_sha256,
+                "selector_verifier_top_k": 8,
+                "selector_tree_budget": 4,
+                "selector_tree_depth_log_bias": -0.375,
+            }
+            full_model = _make_model(logits_chunk_size=0, **common)
+            chunked_model = _make_model(logits_chunk_size=4, **common)
+        chunked_model.load_state_dict(full_model.state_dict())
+        generator = torch.Generator().manual_seed(223)
+        full_hidden = torch.randn(2, 8, 16, generator=generator, requires_grad=True)
+        chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
+        target_hidden = torch.randn(2, 8, 16, generator=generator)
+        target_ids = torch.randint(0, 16, (2, 2, 4), generator=generator)
+        full_head = torch.randn(32, 16, generator=generator, requires_grad=True)
+        chunked_head = full_head.detach().clone().requires_grad_(True)
+
+        full_result = full_model._compute_token_statistics(
+            full_hidden, full_head, target_ids, target_hidden
         )
-        self.assertTrue(
-            torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5)
+        chunked_result = chunked_model._compute_token_statistics(
+            chunked_hidden, chunked_head, target_ids, target_hidden
         )
+
+        for full_value, chunked_value in zip(full_result, chunked_result, strict=True):
+            self.assertTrue(torch.allclose(full_value, chunked_value, atol=1e-6, rtol=1e-6))
+        (full_result[0].sum() + full_result[2].sum() + full_result[3].sum()).backward()
+        (chunked_result[0].sum() + chunked_result[2].sum() + chunked_result[3].sum()).backward()
+        self.assertTrue(torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5))
         chunked_parameters = dict(chunked_model.named_parameters())
         for name, full_parameter in full_model.named_parameters():
             chunked_parameter = chunked_parameters[name]
@@ -1083,12 +1278,8 @@ class TestDFlash2Forward(unittest.TestCase):
             )
         (full_result[0].sum() + full_result[3].sum()).backward()
         (chunked_result[0].sum() + chunked_result[3].sum()).backward()
-        self.assertTrue(
-            torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5)
-        )
-        self.assertTrue(
-            torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5)
-        )
+        self.assertTrue(torch.allclose(full_hidden.grad, chunked_hidden.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(full_head.grad, chunked_head.grad, atol=1e-5, rtol=1e-5))
 
     def test_opd_rejected_stream_uses_k3_and_position_decay(self):
         model = _make_model(loss_objective="opd", ce_loss_alpha=0)
@@ -1155,9 +1346,7 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue(torch.allclose(numerator, torch.tensor(57.0)))
         self.assertTrue(torch.allclose(denominator, torch.tensor(2.0)))
         numerator.backward()
-        self.assertTrue(
-            torch.allclose(student_logprobs.grad, torch.tensor([1.0, 0.0]))
-        )
+        self.assertTrue(torch.allclose(student_logprobs.grad, torch.tensor([1.0, 0.0])))
 
     def test_opd_anchor_plan_uses_dynamic_observed_width(self):
         model = _make_model(loss_objective="opd", ce_loss_alpha=0)
@@ -1297,9 +1486,7 @@ class TestDFlash2Export(unittest.TestCase):
         trainer = trainer_class.__new__(trainer_class)
         trainer.trainable_scope = "all"
         model = DFlash2DraftModel(_make_config())
-        before = {
-            name: parameter.requires_grad for name, parameter in model.named_parameters()
-        }
+        before = {name: parameter.requires_grad for name, parameter in model.named_parameters()}
 
         trainer._configure_trainable_parameters(model)
 

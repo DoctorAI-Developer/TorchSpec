@@ -171,7 +171,9 @@ class TrainingConfig:
     dflash2_trainable_scope: str = "all"
     # teacher_ce exactly preserves existing behavior. sampling_tv optimizes
     # one-step overlap on the deployed reduced-head/top-16 distribution;
-    # sampling_path optimizes its differentiable accepted-prefix survival.
+    # sampling_path optimizes its differentiable accepted-prefix survival;
+    # sampling_tree ranks the reachable gold path against the exact bounded
+    # best-first serving frontier and retains a sampling-path regularizer.
     dflash2_selector_objective: str = "teacher_ce"
     dflash2_selector_token_map_path: Optional[str] = None
     dflash2_selector_token_map_sha256: Optional[str] = None
@@ -179,6 +181,13 @@ class TrainingConfig:
     dflash2_selector_verifier_temperature: float = 1.0
     dflash2_selector_verifier_top_k: int = 20
     dflash2_selector_verifier_top_p: float = 0.95
+    # Explicit for sampling_tree: zero prevents a silent mismatch with the
+    # serving verification width. The depth reward must match the deployed
+    # selector-tree builder; the margin and path weight affect training only.
+    dflash2_selector_tree_budget: int = 0
+    dflash2_selector_tree_depth_log_bias: float = 0.0
+    dflash2_selector_tree_margin: float = 0.0
+    dflash2_selector_tree_path_weight: float = 0.25
     dflash2_opd_rejected_stream_weight: float = 1.0
     dflash2_opd_rejected_position_decay: float = 0.8
     # Preserve K3's exact, bounded-gradient negative tail while retaining the
@@ -359,24 +368,27 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
             f"(got {config.training.dflash2_logits_chunk_size}); 0 disables chunking"
         )
     selector_objective = config.training.dflash2_selector_objective
-    if selector_objective not in {"teacher_ce", "sampling_tv", "sampling_path"}:
+    if selector_objective not in {
+        "teacher_ce",
+        "sampling_tv",
+        "sampling_path",
+        "sampling_tree",
+    }:
         raise ValueError(
             "dflash2_selector_objective must be one of teacher_ce, sampling_tv, "
-            "or sampling_path"
+            "sampling_path, or sampling_tree"
         )
     selector_map_path = config.training.dflash2_selector_token_map_path
     selector_map_sha256 = config.training.dflash2_selector_token_map_sha256
     if selector_objective == "teacher_ce":
         if selector_map_path is not None or selector_map_sha256 is not None:
             raise ValueError(
-                "DFlash2 selector token-map fields require a sampling-aligned "
-                "selector objective"
+                "DFlash2 selector token-map fields require a sampling-aligned selector objective"
             )
     else:
         if config.training.dflash_loss_objective != "opd":
             raise ValueError(
-                "sampling-aligned DFlash2 selector objectives require "
-                "dflash_loss_objective=opd"
+                "sampling-aligned DFlash2 selector objectives require dflash_loss_objective=opd"
             )
         if not selector_map_path or not selector_map_sha256:
             raise ValueError(
@@ -392,25 +404,33 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
                 "dflash2_selector_token_map_sha256 must be 64 lowercase hex characters"
             )
     if config.training.dflash2_trainable_scope not in {"all", "selector_only"}:
-        raise ValueError(
-            "dflash2_trainable_scope must be one of all or selector_only"
-        )
-    if (
-        not 0 < config.training.dflash2_selector_temperature
-        or not math.isfinite(config.training.dflash2_selector_temperature)
+        raise ValueError("dflash2_trainable_scope must be one of all or selector_only")
+    if not 0 < config.training.dflash2_selector_temperature or not math.isfinite(
+        config.training.dflash2_selector_temperature
     ):
         raise ValueError("dflash2_selector_temperature must be finite and positive")
-    if (
-        config.training.dflash2_selector_verifier_temperature < 0
-        or not math.isfinite(config.training.dflash2_selector_verifier_temperature)
+    if config.training.dflash2_selector_verifier_temperature < 0 or not math.isfinite(
+        config.training.dflash2_selector_verifier_temperature
     ):
-        raise ValueError(
-            "dflash2_selector_verifier_temperature must be finite and non-negative"
-        )
+        raise ValueError("dflash2_selector_verifier_temperature must be finite and non-negative")
     if config.training.dflash2_selector_verifier_top_k < 1:
         raise ValueError("dflash2_selector_verifier_top_k must be positive")
     if not 0 < config.training.dflash2_selector_verifier_top_p <= 1:
         raise ValueError("dflash2_selector_verifier_top_p must be in (0, 1]")
+    if selector_objective == "sampling_tree" and (
+        config.training.dflash2_selector_tree_budget <= 0
+    ):
+        raise ValueError("sampling_tree requires a positive dflash2_selector_tree_budget")
+    if not math.isfinite(config.training.dflash2_selector_tree_depth_log_bias):
+        raise ValueError("dflash2_selector_tree_depth_log_bias must be finite")
+    if config.training.dflash2_selector_tree_margin < 0 or not math.isfinite(
+        config.training.dflash2_selector_tree_margin
+    ):
+        raise ValueError("dflash2_selector_tree_margin must be finite and non-negative")
+    if config.training.dflash2_selector_tree_path_weight < 0 or not math.isfinite(
+        config.training.dflash2_selector_tree_path_weight
+    ):
+        raise ValueError("dflash2_selector_tree_path_weight must be finite and non-negative")
     if config.training.dflash2_opd_rejected_stream_weight < 0:
         raise ValueError("dflash2_opd_rejected_stream_weight must be non-negative")
     if not 0 < config.training.dflash2_opd_rejected_position_decay <= 1:
@@ -420,9 +440,7 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         "tv",
         "lk",
     }:
-        raise ValueError(
-            "dflash2_opd_accepted_objective must be one of forward_kl, tv, or lk"
-        )
+        raise ValueError("dflash2_opd_accepted_objective must be one of forward_kl, tv, or lk")
 
 
 def _save_config_snapshot(config: DictConfig) -> None:

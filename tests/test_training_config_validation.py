@@ -68,9 +68,7 @@ def test_validate_training_batch_config_accepts_positive():
 
 
 def test_load_config_rejects_invalid_opd_accepted_objective():
-    base = _resolved_training_config(
-        dflash2_opd_accepted_objective="unsupported"
-    )
+    base = _resolved_training_config(dflash2_opd_accepted_objective="unsupported")
     with pytest.raises(ValueError, match="dflash2_opd_accepted_objective"):
         load_config(base_config=base)
 
@@ -103,6 +101,32 @@ def test_load_config_requires_sampling_selector_map_and_opd():
     )
     with pytest.raises(ValueError, match="dflash_loss_objective=opd"):
         load_config(base_config=wrong_objective)
+
+
+def test_load_config_requires_explicit_sampling_tree_budget():
+    base = _resolved_training_config(
+        dflash_loss_objective="opd",
+        dflash_ce_loss_alpha=0,
+        dflash2_selector_objective="sampling_tree",
+        dflash2_selector_token_map_path="/tmp/map.pt",
+        dflash2_selector_token_map_sha256="0" * 64,
+    )
+    with pytest.raises(ValueError, match="positive dflash2_selector_tree_budget"):
+        load_config(base_config=base)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("dflash2_selector_tree_depth_log_bias", float("nan"), "depth_log_bias"),
+        ("dflash2_selector_tree_margin", -0.1, "tree_margin"),
+        ("dflash2_selector_tree_path_weight", -0.1, "tree_path_weight"),
+    ),
+)
+def test_load_config_rejects_invalid_selector_tree_values(field, value, message):
+    base = _resolved_training_config(**{field: value})
+    with pytest.raises(ValueError, match=message):
+        load_config(base_config=base)
 
 
 @pytest.mark.parametrize(
