@@ -249,6 +249,8 @@ def _get_draft_model_config(args):
 
     draft_config_path = getattr(args, "draft_model_config", None)
     if draft_config_path is not None:
+        if os.path.isdir(draft_config_path):
+            draft_config_path = os.path.join(draft_config_path, "config.json")
         return AutoDraftModelConfig.from_file(draft_config_path)
 
     config_dict = generate_draft_model_config(

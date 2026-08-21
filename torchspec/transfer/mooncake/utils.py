@@ -26,6 +26,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlparse
@@ -45,6 +46,10 @@ def resolve_mooncake_master_bin() -> str:
     which_result = shutil.which("mooncake_master")
     if which_result:
         return which_result
+
+    environment_bin = os.path.join(os.path.dirname(sys.executable), "mooncake_master")
+    if os.path.isfile(environment_bin) and os.access(environment_bin, os.X_OK):
+        return environment_bin
 
     home = os.path.expanduser("~")
     return os.path.join(home, "build/mooncake-store/src/mooncake_master")

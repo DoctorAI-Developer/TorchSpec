@@ -25,9 +25,23 @@ class TestResolveMooncakeMasterBin:
             result = resolve_mooncake_master_bin()
         assert result == "/usr/bin/mooncake_master"
 
+    def test_uses_active_python_environment_bin(self, monkeypatch):
+        monkeypatch.delenv("MOONCAKE_BUILD_DIR", raising=False)
+        with (
+            mock.patch("shutil.which", return_value=None),
+            mock.patch("sys.executable", "/env/bin/python"),
+            mock.patch("os.path.isfile", return_value=True),
+            mock.patch("os.access", return_value=True),
+        ):
+            result = resolve_mooncake_master_bin()
+        assert result == "/env/bin/mooncake_master"
+
     def test_falls_back_to_default_path(self, monkeypatch):
         monkeypatch.delenv("MOONCAKE_BUILD_DIR", raising=False)
-        with mock.patch("shutil.which", return_value=None):
+        with (
+            mock.patch("shutil.which", return_value=None),
+            mock.patch("os.path.isfile", return_value=False),
+        ):
             result = resolve_mooncake_master_bin()
         assert "build/mooncake-store/src/mooncake_master" in result
 

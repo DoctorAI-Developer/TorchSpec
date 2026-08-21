@@ -206,6 +206,23 @@ def _batch(seed=0, all_masked=False, with_last_hidden_states=False):
 
 
 class TestDFlash2Config(unittest.TestCase):
+    def test_draft_config_accepts_huggingface_model_directory(self):
+        from torchspec.train_entry import _get_draft_model_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory, "config.json")
+            config_path.write_text(
+                json.dumps(
+                    _tiny_config_kwargs(architectures=["DFlash2DraftModel"])
+                )
+            )
+
+            config = _get_draft_model_config(
+                Namespace(draft_model_config=directory)
+            )
+
+        self.assertIsInstance(config, DFlash2Config)
+
     def test_repository_config_dispatches_to_dflash2(self):
         config_path = ROOT / "torchspec" / "config" / "dflash2_draft_config.json"
         self.assertTrue(config_path.is_file())
