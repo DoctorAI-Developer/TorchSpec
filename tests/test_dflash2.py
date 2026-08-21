@@ -159,6 +159,7 @@ def _make_model(
     selector_tree_depth_log_bias=0.0,
     selector_tree_margin=0.0,
     selector_tree_path_weight=0.25,
+    selector_tree_listwise_temperature=0.1,
     selector_taps_local_weight=1.0,
     selector_taps_reach_weight=0.25,
 ):
@@ -185,6 +186,7 @@ def _make_model(
         selector_tree_depth_log_bias=selector_tree_depth_log_bias,
         selector_tree_margin=selector_tree_margin,
         selector_tree_path_weight=selector_tree_path_weight,
+        selector_tree_listwise_temperature=selector_tree_listwise_temperature,
         selector_taps_local_weight=selector_taps_local_weight,
         selector_taps_reach_weight=selector_taps_reach_weight,
         opd_rejected_k3_preserve_negative_tail=(opd_rejected_k3_preserve_negative_tail),
@@ -812,6 +814,85 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertGreater(breadth_first[0, 1].item(), 0.0)
         self.assertEqual(deeper_first.sum().item(), 0.0)
 
+    def test_tree_frontier_listwise_loss_protects_a_correct_close_decision(self):
+        candidate_ids = torch.tensor([[[10, 11], [20, 21]]], dtype=torch.int64)
+        edge_scores = torch.tensor(
+            [[[[0.1, 0.0], [0.1, 0.0]], [[0.0, 0.0], [0.0, 0.0]]]],
+            requires_grad=True,
+        )
+        target_ids = torch.tensor([[10, 20]], dtype=torch.int64)
+
+        pairwise = _tree_frontier_ranking_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=1,
+            depth_log_bias=0.0,
+            margin=0.0,
+        )
+        listwise = _tree_frontier_ranking_loss(
+            candidate_ids,
+            edge_scores,
+            target_ids,
+            budget=1,
+            depth_log_bias=0.0,
+            margin=0.0,
+            listwise_temperature=0.1,
+        )
+
+        self.assertEqual(pairwise.sum().item(), 0.0)
+        self.assertGreater(listwise[0, 0].item(), 0.0)
+        listwise.sum().backward()
+        self.assertLess(edge_scores.grad[0, 0, 0, 0].item(), 0.0)
+        self.assertGreater(edge_scores.grad[0, 0, 0, 1].item(), 0.0)
+
+    def test_tree_frontier_listwise_loss_rejects_invalid_temperature(self):
+        candidate_ids = torch.tensor([[[10, 11]]], dtype=torch.int64)
+        edge_scores = torch.zeros(1, 1, 2, 2)
+        target_ids = torch.tensor([[10]], dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "listwise temperature"):
+            _tree_frontier_ranking_loss(
+                candidate_ids,
+                edge_scores,
+                target_ids,
+                budget=1,
+                depth_log_bias=0.0,
+                margin=0.0,
+                listwise_temperature=0.0,
+            )
+
+    def test_tree_frontier_listwise_gradient_matches_finite_difference(self):
+        candidate_ids = torch.tensor([[[10, 11]]], dtype=torch.int64)
+        target_ids = torch.tensor([[10]], dtype=torch.int64)
+
+        def objective(values):
+            scores = values.reshape(1, 1, 2, 2)
+            return _tree_frontier_ranking_loss(
+                candidate_ids,
+                scores,
+                target_ids,
+                budget=1,
+                depth_log_bias=0.0,
+                margin=0.0,
+                listwise_temperature=0.2,
+            ).sum()
+
+        values = torch.tensor([0.4, -0.1, 0.2, -0.3], requires_grad=True)
+        objective(values).backward()
+        analytic = values.grad.detach().clone()
+        epsilon = 1e-3
+        finite = torch.empty_like(values)
+        with torch.no_grad():
+            for index in range(values.numel()):
+                positive = values.detach().clone()
+                negative = values.detach().clone()
+                positive[index] += epsilon
+                negative[index] -= epsilon
+                finite[index] = (objective(positive) - objective(negative)) / (2 * epsilon)
+
+        self.assertTrue(torch.allclose(analytic, finite, atol=2e-4, rtol=2e-3))
+
     def test_sampling_tree_loss_combines_frontier_and_path_terms(self):
         with tempfile.TemporaryDirectory() as directory:
             map_path, map_sha256 = _write_selector_map(
@@ -998,6 +1079,47 @@ class TestDFlash2Forward(unittest.TestCase):
         self.assertTrue(torch.equal(captured_targets, targets[..., 1:].reshape(1, 2)))
         self.assertTrue(torch.allclose(captured_scores, expected_scores.reshape(1, 2, 2, 2)))
         self.assertEqual(frontier.call_args.kwargs["budget"], 2)
+
+    def test_sampling_tree_listwise_forwards_temperature(self):
+        config = _make_config(
+            hidden_size=4,
+            vocab_size=6,
+            num_target_layers=1,
+            block_size=3,
+            selector_rank=2,
+            selector_top_k=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            map_path, map_sha256 = _write_selector_map(
+                directory,
+                torch.arange(6, dtype=torch.int64),
+            )
+            model = DFlash2Model(
+                DFlash2DraftModel(config),
+                block_size=3,
+                num_anchors=1,
+                loss_objective="opd",
+                ce_loss_alpha=0,
+                selector_objective="sampling_tree_listwise",
+                selector_token_map_path=map_path,
+                selector_token_map_sha256=map_sha256,
+                selector_verifier_temperature=0.0,
+                selector_verifier_top_k=1,
+                selector_verifier_top_p=1.0,
+                selector_tree_budget=2,
+                selector_tree_listwise_temperature=0.125,
+            )
+        hidden = torch.randn(1, 1, 2, 4)
+        logits = torch.randn(1, 1, 2, 6)
+        targets = torch.tensor([[[5, 1, 2]]], dtype=torch.int64)
+
+        with mock.patch(
+            "torchspec.models.dflash2._tree_frontier_ranking_loss",
+            return_value=torch.zeros(1, 2),
+        ) as frontier:
+            model._selector_tree_frontier_loss(hidden, logits, targets)
+
+        self.assertEqual(frontier.call_args.kwargs["listwise_temperature"], 0.125)
 
     def test_sampling_taps_builds_the_same_markov_lattice_as_serving(self):
         config = _make_config(

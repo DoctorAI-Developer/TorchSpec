@@ -103,11 +103,12 @@ def test_load_config_requires_sampling_selector_map_and_opd():
         load_config(base_config=wrong_objective)
 
 
-def test_load_config_requires_explicit_sampling_tree_budget():
+@pytest.mark.parametrize("objective", ("sampling_tree", "sampling_tree_listwise"))
+def test_load_config_requires_explicit_sampling_tree_budget(objective):
     base = _resolved_training_config(
         dflash_loss_objective="opd",
         dflash_ce_loss_alpha=0,
-        dflash2_selector_objective="sampling_tree",
+        dflash2_selector_objective=objective,
         dflash2_selector_token_map_path="/tmp/map.pt",
         dflash2_selector_token_map_sha256="0" * 64,
     )
@@ -147,6 +148,7 @@ def test_load_config_requires_explicit_sampling_taps_budget_and_greedy_target():
         ("dflash2_selector_tree_depth_log_bias", float("nan"), "depth_log_bias"),
         ("dflash2_selector_tree_margin", -0.1, "tree_margin"),
         ("dflash2_selector_tree_path_weight", -0.1, "tree_path_weight"),
+        ("dflash2_selector_tree_listwise_temperature", 0.0, "listwise_temperature"),
         ("dflash2_selector_taps_local_weight", -0.1, "taps_local_weight"),
         ("dflash2_selector_taps_reach_weight", float("nan"), "taps_reach_weight"),
     ),

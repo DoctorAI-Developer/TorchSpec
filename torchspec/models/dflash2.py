@@ -35,6 +35,7 @@ _VALID_SELECTOR_OBJECTIVES = {
     "sampling_path",
     "sampling_taps",
     "sampling_tree",
+    "sampling_tree_listwise",
     "sampling_tv",
 }
 
@@ -47,14 +48,19 @@ def _tree_frontier_ranking_loss(
     budget: int,
     depth_log_bias: float,
     margin: float,
+    listwise_temperature: float | None = None,
 ) -> torch.Tensor:
     """Differentiate ranking mistakes made by the deployed bounded tree.
 
     Allocation itself is discrete and follows the serving builder with
-    stop-gradient choices. At each slot, if an off-path edge beats the next
-    reachable gold-path edge, a softplus margin pushes those two *actual
-    frontier scores* in the opposite direction. Loss is accumulated at the
-    blocked gold depth and normalized by the fixed tree budget.
+    stop-gradient choices. The default pairwise mode preserves historical
+    behavior: when an off-path edge beats the next reachable gold-path edge, a
+    softplus margin pushes those two *actual frontier scores* in the opposite
+    direction. With ``listwise_temperature`` set, every reachable gold edge is
+    compared against all other valid frontier edges using a temperature-scaled
+    multiclass margin. That supplies a preservation gradient even when the
+    current allocation is correct but close to the B/B+1 cutoff. Loss is
+    accumulated at the active gold depth and normalized by the fixed budget.
 
     Inputs are a flattened batch of Markov lattices: ``candidate_ids`` is
     ``[N, depth, K]``, ``edge_scores`` is ``[N, depth, K, K]``, and
@@ -76,6 +82,10 @@ def _tree_frontier_ranking_loss(
         raise ValueError("tree depth log bias must be finite")
     if margin < 0 or not math.isfinite(margin):
         raise ValueError("tree ranking margin must be finite and non-negative")
+    if listwise_temperature is not None and (
+        listwise_temperature <= 0 or not math.isfinite(listwise_temperature)
+    ):
+        raise ValueError("tree listwise temperature must be finite and positive")
     if batch == 0:
         return edge_scores.new_zeros((0, depth_limit), dtype=torch.float32)
 
@@ -168,10 +178,23 @@ def _tree_frontier_ranking_loss(
         chose_gold = (
             next_gold_present & chosen_parent.eq(gold_parent) & chosen_child.eq(next_gold_child)
         )
-        rank_loss = F.softplus(chosen_score - gold_score + margin)
-        loss_terms.append(
-            torch.where(next_gold_present & ~chose_gold, rank_loss, torch.zeros_like(rank_loss))
-        )
+        if listwise_temperature is None:
+            rank_loss = F.softplus(chosen_score - gold_score + margin)
+            active_loss = next_gold_present & ~chose_gold
+        else:
+            gold_edge = parent_grid.eq(gold_parent[:, None, None]) & child_grid.eq(
+                next_gold_child[:, None, None]
+            )
+            competitor_scores = selection_scores.masked_fill(~(valid & ~gold_edge), -torch.inf)
+            scaled_competitor_lse = torch.logsumexp(
+                (competitor_scores + margin) / listwise_temperature,
+                dim=(1, 2),
+            )
+            rank_loss = listwise_temperature * F.softplus(
+                scaled_competitor_lse - gold_score / listwise_temperature
+            )
+            active_loss = next_gold_present
+        loss_terms.append(torch.where(active_loss, rank_loss, torch.zeros_like(rank_loss)))
         loss_depths.append(safe_gold_depth)
 
         selected_parent.append(chosen_parent)
@@ -459,6 +482,7 @@ class DFlash2Model(DFlashModel):
         selector_tree_depth_log_bias: float = 0.0,
         selector_tree_margin: float = 0.0,
         selector_tree_path_weight: float = 0.25,
+        selector_tree_listwise_temperature: float = 0.1,
         selector_taps_local_weight: float = 1.0,
         selector_taps_reach_weight: float = 0.25,
         logits_chunk_size: int = 0,
@@ -491,6 +515,7 @@ class DFlash2Model(DFlashModel):
         self.selector_tree_depth_log_bias = float(selector_tree_depth_log_bias)
         self.selector_tree_margin = float(selector_tree_margin)
         self.selector_tree_path_weight = float(selector_tree_path_weight)
+        self.selector_tree_listwise_temperature = float(selector_tree_listwise_temperature)
         self.selector_taps_local_weight = float(selector_taps_local_weight)
         self.selector_taps_reach_weight = float(selector_taps_reach_weight)
         if not math.isfinite(self.selector_temperature) or self.selector_temperature <= 0:
@@ -507,7 +532,11 @@ class DFlash2Model(DFlashModel):
             or not 0 < self.selector_verifier_top_p <= 1
         ):
             raise ValueError("dflash2_selector_verifier_top_p must be in (0, 1]")
-        if self.selector_objective in {"sampling_taps", "sampling_tree"}:
+        if self.selector_objective in {
+            "sampling_taps",
+            "sampling_tree",
+            "sampling_tree_listwise",
+        }:
             max_tree_budget = (self.block_size - 1) * int(config.selector_top_k)
             if not 1 <= self.selector_tree_budget <= max_tree_budget:
                 raise ValueError(
@@ -520,6 +549,12 @@ class DFlash2Model(DFlashModel):
             raise ValueError("dflash2_selector_tree_margin must be finite and non-negative")
         if self.selector_tree_path_weight < 0 or not math.isfinite(self.selector_tree_path_weight):
             raise ValueError("dflash2_selector_tree_path_weight must be finite and non-negative")
+        if self.selector_tree_listwise_temperature <= 0 or not math.isfinite(
+            self.selector_tree_listwise_temperature
+        ):
+            raise ValueError(
+                "dflash2_selector_tree_listwise_temperature must be finite and positive"
+            )
         if self.selector_taps_local_weight < 0 or not math.isfinite(
             self.selector_taps_local_weight
         ):
@@ -732,6 +767,11 @@ class DFlash2Model(DFlashModel):
             budget=self.selector_tree_budget,
             depth_log_bias=self.selector_tree_depth_log_bias,
             margin=self.selector_tree_margin,
+            listwise_temperature=(
+                self.selector_tree_listwise_temperature
+                if self.selector_objective == "sampling_tree_listwise"
+                else None
+            ),
         ).reshape(*target_ids.shape[:-1], depth_limit)
 
     def _selector_tree_taps_loss(
@@ -868,7 +908,7 @@ class DFlash2Model(DFlashModel):
                     target_indices.reshape(-1),
                     reduction="none",
                 ).reshape_as(target_indices)
-            elif self.selector_objective == "sampling_tree":
+            elif self.selector_objective in {"sampling_tree", "sampling_tree_listwise"}:
                 selector_overlap = self._selector_sampling_overlap(
                     hidden[..., 1:, :],
                     chunk_logits[..., 1:, :],
@@ -980,7 +1020,11 @@ class DFlash2Model(DFlashModel):
         selector_weights = native_weights if self.loss_objective == "auf" else objective_weights
         eligible_weights = selector_weights[..., 1:]
         eligible_weights = eligible_weights * (eligible_weights > 0).cumprod(dim=-1)
-        if self.selector_objective in {"sampling_taps", "sampling_tree"}:
+        if self.selector_objective in {
+            "sampling_taps",
+            "sampling_tree",
+            "sampling_tree_listwise",
+        }:
             expected_shape = (*eligible_weights.shape, 2)
             if logits.shape != expected_shape:
                 raise RuntimeError(
@@ -988,7 +1032,7 @@ class DFlash2Model(DFlashModel):
                     f"two-component statistics, got {tuple(logits.shape)} "
                     f"instead of {expected_shape}"
                 )
-            if self.selector_objective == "sampling_tree":
+            if self.selector_objective in {"sampling_tree", "sampling_tree_listwise"}:
                 tree_loss = logits[..., 0]
                 selector_payload = logits[..., 1]
             else:
@@ -1026,7 +1070,11 @@ class DFlash2Model(DFlashModel):
             selector_payload = logits
 
         loss_components = {}
-        if self.selector_objective in {"sampling_path", "sampling_tree"}:
+        if self.selector_objective in {
+            "sampling_path",
+            "sampling_tree",
+            "sampling_tree_listwise",
+        }:
             overlap = selector_payload
             valid_prefix = (eligible_weights > 0).to(torch.int64).cumprod(dim=-1).bool()
             prefix_survival = torch.cumprod(
@@ -1034,7 +1082,7 @@ class DFlash2Model(DFlashModel):
                 dim=-1,
             )
             path_loss = 1.0 - prefix_survival
-            if self.selector_objective == "sampling_tree":
+            if self.selector_objective in {"sampling_tree", "sampling_tree_listwise"}:
                 selector_loss = tree_loss + self.selector_tree_path_weight * path_loss
                 tree_num = (tree_loss * eligible_weights).sum()
                 tree_den = eligible_weights.sum().detach()

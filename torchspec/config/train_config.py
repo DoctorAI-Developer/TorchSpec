@@ -172,8 +172,9 @@ class TrainingConfig:
     # teacher_ce exactly preserves existing behavior. sampling_tv optimizes
     # one-step overlap on the deployed reduced-head/top-16 distribution;
     # sampling_path optimizes its differentiable accepted-prefix survival;
-    # sampling_tree ranks the reachable gold path against the exact bounded
-    # best-first serving frontier and retains a sampling-path regularizer;
+    # sampling_tree ranks mistakes against the exact bounded best-first serving
+    # frontier; sampling_tree_listwise also regularizes correct-but-fragile
+    # decisions against every live frontier competitor;
     # sampling_taps distills local greedy-target preference and positive/
     # negative prefix reach over the same bounded allocator.
     dflash2_selector_objective: str = "teacher_ce"
@@ -190,6 +191,7 @@ class TrainingConfig:
     dflash2_selector_tree_depth_log_bias: float = 0.0
     dflash2_selector_tree_margin: float = 0.0
     dflash2_selector_tree_path_weight: float = 0.25
+    dflash2_selector_tree_listwise_temperature: float = 0.1
     dflash2_selector_taps_local_weight: float = 1.0
     dflash2_selector_taps_reach_weight: float = 0.25
     dflash2_opd_rejected_stream_weight: float = 1.0
@@ -378,10 +380,11 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         "sampling_path",
         "sampling_taps",
         "sampling_tree",
+        "sampling_tree_listwise",
     }:
         raise ValueError(
             "dflash2_selector_objective must be one of teacher_ce, sampling_tv, "
-            "sampling_path, sampling_taps, or sampling_tree"
+            "sampling_path, sampling_taps, sampling_tree, or sampling_tree_listwise"
         )
     selector_map_path = config.training.dflash2_selector_token_map_path
     selector_map_sha256 = config.training.dflash2_selector_token_map_sha256
@@ -422,9 +425,11 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         raise ValueError("dflash2_selector_verifier_top_k must be positive")
     if not 0 < config.training.dflash2_selector_verifier_top_p <= 1:
         raise ValueError("dflash2_selector_verifier_top_p must be in (0, 1]")
-    if selector_objective in {"sampling_taps", "sampling_tree"} and (
-        config.training.dflash2_selector_tree_budget <= 0
-    ):
+    if selector_objective in {
+        "sampling_taps",
+        "sampling_tree",
+        "sampling_tree_listwise",
+    } and (config.training.dflash2_selector_tree_budget <= 0):
         raise ValueError(
             "bounded-tree selector objectives require a positive dflash2_selector_tree_budget"
         )
@@ -438,6 +443,10 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         config.training.dflash2_selector_tree_path_weight
     ):
         raise ValueError("dflash2_selector_tree_path_weight must be finite and non-negative")
+    if config.training.dflash2_selector_tree_listwise_temperature <= 0 or not math.isfinite(
+        config.training.dflash2_selector_tree_listwise_temperature
+    ):
+        raise ValueError("dflash2_selector_tree_listwise_temperature must be finite and positive")
     if config.training.dflash2_selector_taps_local_weight < 0 or not math.isfinite(
         config.training.dflash2_selector_taps_local_weight
     ):
